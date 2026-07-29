@@ -193,24 +193,46 @@ def plan(tracks: list[dict], overrides: dict | None = None) -> list[dict]:
     winner: there is no library-wide truth about whether a band's name includes the
     article, and the quiz already treats them as identical. An explicit --map
     override still wins, for the cases where you DO have an opinion.
+    ONE TARGET PER ARTIST, decided for the whole group before any file is
+    considered. Deciding per file instead lets a single plan contain both
+    directions at once: on the real library, files spelled 'suede' carried
+    album_artist='Suede' (11 of them) while the 2 files already spelled 'Suede'
+    fell through to a majority vote that 'suede' won on count — so one run wrote
+    11 files up and 2 files back down. 13 of 180 artists were self-contradictory
+    that way, 45 files written against their own plan, 'AC/DC' -> 'Ac/Dc' among
+    them. Resolving the group first makes a pass IDEMPOTENT: every file lands on
+    the same spelling, so a second pass has nothing to do.
     """
     groups: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    # album_artist evidence, tallied per GROUP: how many files vouch for each
+    # spelling by carrying it as their album artist
+    vouched: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for t in tracks:
-        groups[artist_key(t["artist"])][t["artist"]] += 1
-    majority = {k: max(v, key=lambda a: (v[a], len(a))) for k, v in groups.items()}
+        k = artist_key(t["artist"])
+        groups[k][t["artist"]] += 1
+        if t["album_artist"] and artist_key(t["album_artist"]) == k:
+            vouched[k][t["album_artist"]] += 1
     override_by_key = {artist_key(k): v for k, v in (overrides or {}).items()}
+
+    # most files wins, ties to the longer string ('AC/DC' over 'ACDC')
+    def _best(tally: dict[str, int]) -> str:
+        return max(tally, key=lambda a: (tally[a], len(a)))
+
+    target_for: dict[str, tuple[str, str]] = {}
+    for k, spellings in groups.items():
+        if k in override_by_key:
+            target_for[k] = (override_by_key[k], "override")
+        elif vouched[k]:
+            target_for[k] = (_best(vouched[k]), "album_artist")
+        elif len(spellings) > 1:
+            target_for[k] = (_best(spellings), "majority")
 
     changes = []
     for t in tracks:
         k = artist_key(t["artist"])
-        if k in override_by_key:
-            target, why = override_by_key[k], "override"
-        elif t["album_artist"] and artist_key(t["album_artist"]) == k:
-            target, why = t["album_artist"], "album_artist"
-        elif len(groups[k]) > 1:
-            target, why = majority[k], "majority"
-        else:
-            continue  # single spelling, nothing to apply
+        if k not in target_for:
+            continue  # single spelling and nothing to apply — leave it alone
+        target, why = target_for[k]
         if why != "override" and _article_only(target, t["artist"]):
             continue  # 'The Verve' vs 'Verve' — already one band to the quiz
         if target != t["artist"]:
@@ -229,13 +251,25 @@ def _write(changes: list[dict], cache: dict | None = None, set_stage=None) -> in
     artist, and the next run would plan the same writes all over again. The
     journal hides that, but only while the journal survives; on a fresh container
     with an empty /data it would rewrite the whole library.
+
+    The journal records "path -> target", not just the path. Keyed on path alone
+    it also skips a file that needs a DIFFERENT write than the one it already
+    got, which is how a stale journal blocked 21 corrections after an earlier
+    self-contradictory plan (see plan()). Resuming must skip only the exact write
+    it already did.
     """
     done = set()
     jp = _journal_path()
     if os.path.exists(jp):
         try:
             with open(jp) as fh:
-                done = {ln.rstrip("\n") for ln in fh if ln.strip()}
+                # A pre-upgrade journal holds bare paths with no target, so its
+                # lines simply never match and are ignored. That is the safe
+                # direction: plan() only emits a change when the tag actually
+                # differs, so the worst case is rewriting a file with the value
+                # it already needed. Honouring a bare path instead would keep
+                # blocking the corrections this fix exists to unblock.
+                done = {ln.rstrip("\n") for ln in fh if "\t" in ln}
             LOGGER.info("retag: journal has %d already-written file(s)", len(done))
         except OSError as e:
             LOGGER.warning("retag journal unreadable, ignoring: %s", e)
@@ -244,7 +278,8 @@ def _write(changes: list[dict], cache: dict | None = None, set_stage=None) -> in
     total = len(changes)
     with open(jp, "a") as journal:
         for i, c in enumerate(changes, 1):
-            if c["path"] in done:
+            entry = f"{c['path']}\t{c['target']}"
+            if entry in done:
                 skipped += 1
             else:
                 audio = _open_audio(c["path"])
@@ -257,7 +292,7 @@ def _write(changes: list[dict], cache: dict | None = None, set_stage=None) -> in
                             _recache(cache, c["path"], c["target"], c["album_artist"])
                         # flush per file: the journal is only useful if it
                         # survives the kill that made us need it
-                        journal.write(c["path"] + "\n")
+                        journal.write(entry + "\n")
                         journal.flush()
                     except Exception as e:  # noqa: BLE001 — keep going
                         LOGGER.warning("retag: write failed %s (%s)", c["path"], e)
