@@ -477,6 +477,17 @@ class Hub:
         import time as _t
         return self.board_live() or (_t.time() - self.board_last_seen) < 120
 
+    def play_in_room(self) -> bool:
+        """Should this clip go to the house speaker at all?
+
+        No, in two cases. A board is present (or expected) — it plays its own
+        audio, and doubling up puts the room a beat out of sync. Or every player
+        is remote, in which case there is nobody in the room to hear it: each
+        remote phone plays its own copy, so the speaker would be playing to an
+        empty room.
+        """
+        return not self.board_expected() and not (self.game and self.game.everyone_remote())
+
     async def start_round(self):
         if not self.game.rounds:
             conn = db.connect()
@@ -485,7 +496,7 @@ class Hub:
             finally:
                 conn.close()
         rnd = self.game.start_round()
-        if not self.board_expected():  # board plays its own audio when present
+        if self.play_in_room():  # board plays its own audio; all-remote needs no room audio
             asyncio.get_event_loop().run_in_executor(None, ha.play_clip, rnd["track"]["id"], str(rnd["clip_len"]))
         self.cancel_deadline()
         self.deadline_task = asyncio.create_task(self._deadline(game.ANSWER_WINDOW_S))
@@ -502,7 +513,7 @@ class Hub:
                 rnd["replay"] = 1
                 rnd["started_at"] = self.game.clock()
                 rnd["deadline_at"] = rnd["started_at"] + game.ANSWER_WINDOW_S
-                if not self.board_expected():
+                if self.play_in_room():
                     asyncio.get_event_loop().run_in_executor(
                         None, ha.play_clip, rnd["track"]["id"], str(rnd["clip_len"]))
                 self.deadline_task = asyncio.create_task(self._deadline(game.ANSWER_WINDOW_S))
@@ -512,7 +523,7 @@ class Hub:
 
     async def _reveal(self):
         rnd = self.game.reveal()
-        if not self.board_expected():
+        if self.play_in_room():
             asyncio.get_event_loop().run_in_executor(None, ha.play_clip, rnd["track"]["id"], "payoff")
         await self.broadcast()
 
@@ -677,7 +688,7 @@ async def ws_endpoint(ws: WebSocket):
                         # the window moved out with the longer clip — move the reveal too
                         hub.cancel_deadline()
                         hub.deadline_task = asyncio.create_task(hub._deadline(hub.game.window_left()))
-                        if not hub.board_expected():
+                        if hub.play_in_room():
                             asyncio.get_event_loop().run_in_executor(
                                 None, ha.play_clip, hub.game.rounds[hub.game.current]["track"]["id"], str(length))
                         await hub.broadcast()
@@ -742,7 +753,7 @@ async def ws_endpoint(ws: WebSocket):
                                 hub.game.finish(conn)
                             finally:
                                 conn.close()
-                            if not hub.board_expected():  # board plays its own fanfare
+                            if hub.play_in_room():  # board plays its own fanfare
                                 asyncio.get_event_loop().run_in_executor(
                                     None, ha.play_url,
                                     f"{ha.APP_BASE_URL}/static/fanfare.mp3", "fanfare")

@@ -201,6 +201,20 @@ class Game:
             raise GameError("join first")
         self.players[name]["remote"] = bool(remote)
 
+    def everyone_remote(self) -> bool:
+        """True when there IS at least one player and every one of them is remote.
+
+        Nobody is in the room, so playing to the house speaker is just noise in an
+        empty room — and worse than noise if the speaker is somewhere someone is
+        asleep. Each remote phone plays its own copy of the clip, so the room
+        audio adds nothing.
+
+        Empty is False on purpose: a lobby with no players yet is not "everyone
+        remote", and the speaker should still be used for a game that hasn't been
+        joined (the host may be about to walk in).
+        """
+        return bool(self.players) and all(p.get("remote") for p in self.players.values())
+
     # -- rounds --------------------------------------------------------------
     def start_round(self) -> dict:
         if self.phase not in ("lobby", "reveal", "break"):

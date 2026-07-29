@@ -177,7 +177,9 @@ subscriptions.
   buffering doesn't cost them points — the phone reports the start over the
   websocket and the server scores from there (credit capped at 5s, since that
   timestamp comes from the client). Phones in the room stay silent so the room
-  isn't a mess of echoes. Remote players show a 🌐 on the scoreboard. A remote player
+  isn't a mess of echoes. Remote players show a 🌐 on the scoreboard. **If everyone is
+  remote the house speaker is skipped** — nobody's in the room to hear it, and it may be
+  somewhere someone is asleep. A remote player
   can also **start and run the game** — one person elsewhere driving it on their own
   phone audio while everyone else listens together on the house speaker
   ([how, and the no-TV-board caveat](docs/setup.md#hosting-from-another-room)).
