@@ -137,11 +137,19 @@ class Cache:
 
 
 def load_journal(path: str) -> set[str]:
+    """Completed writes as 'path\\ttarget' entries.
+
+    Keyed on the target as well as the path: keyed on the path alone it also skips
+    a file that needs a DIFFERENT write than the one it already got, which is how a
+    stale journal blocked 21 real corrections. Pre-upgrade journals hold bare paths
+    and are ignored — plan() only emits a change when the tag actually differs, so
+    the cost is rewriting a file with the value it already needed.
+    """
     if not path or not os.path.exists(path):
         return set()
     try:
         with open(path) as fh:
-            done = {ln.rstrip("\n") for ln in fh if ln.strip()}
+            done = {ln.rstrip("\n") for ln in fh if "\t" in ln}
         if done:
             note(f"journal: {len(done)} file(s) already written ({path})")
         return done
@@ -213,26 +221,42 @@ def scan(paths: list[str], cache: Cache) -> list[dict]:
 
 
 def plan(tracks: list[dict], overrides: dict) -> list[dict]:
-    """Decide the target spelling per file. See the module docstring for the order."""
-    groups: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
-    for t in tracks:
-        groups[artist_key(t["artist"])][t["artist"]] += 1
+    """Decide ONE target spelling per artist. See the module docstring for the order.
 
-    # rule 3's winner per artist: most files, then longest string
-    majority = {k: max(v, key=lambda a: (v[a], len(a))) for k, v in groups.items()}
+    The decision is per ARTIST, not per file. Deciding per file lets one plan hold
+    both directions at once: files spelled 'suede' carrying album_artist='Suede'
+    move up, while files already spelled 'Suede' with no album_artist fall through
+    to a majority vote that 'suede' can win on count. That cost 45 wrongly-written
+    files on a real library. See app/retag.plan.
+    """
+    groups: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    vouched: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
+    for t in tracks:
+        k = artist_key(t["artist"])
+        groups[k][t["artist"]] += 1
+        if t["album_artist"] and artist_key(t["album_artist"]) == k:
+            vouched[k][t["album_artist"]] += 1
     override_by_key = {artist_key(k): v for k, v in overrides.items()}
+
+    # most files wins, ties to the longer string so 'AC/DC' beats 'ACDC'
+    def best(tally: dict[str, int]) -> str:
+        return max(tally, key=lambda a: (tally[a], len(a)))
+
+    target_for: dict[str, tuple[str, str]] = {}
+    for k, spellings in groups.items():
+        if k in override_by_key:
+            target_for[k] = (override_by_key[k], "--map")
+        elif vouched[k]:
+            target_for[k] = (best(vouched[k]), "album_artist")
+        elif len(spellings) > 1:
+            target_for[k] = (best(spellings), "majority")
 
     changes = []
     for t in tracks:
         k = artist_key(t["artist"])
-        if k in override_by_key:
-            target, why = override_by_key[k], "--map"
-        elif t["album_artist"] and artist_key(t["album_artist"]) == k:
-            target, why = t["album_artist"], "album_artist"
-        elif len(groups[k]) > 1:
-            target, why = majority[k], "majority"
-        else:
+        if k not in target_for:
             continue  # only one spelling and nothing to apply — leave it alone
+        target, why = target_for[k]
         if why != "--map" and _article_only(target, t["artist"]):
             # 'The Verve' vs 'Verve' folds to one artist already, so rewriting the
             # files buys nothing and picks a side at random. See app/retag.plan.
@@ -257,7 +281,8 @@ def apply(changes: list[dict], journal_path: str, done: set[str],
     journal = open(journal_path, "a") if journal_path else None
     try:
         for i, c in enumerate(changes, 1):
-            if c["path"] in done:
+            entry = f"{c['path']}\t{c['target']}"
+            if entry in done:
                 skipped += 1
             else:
                 audio = load(c["path"])
@@ -275,7 +300,7 @@ def apply(changes: list[dict], journal_path: str, done: set[str],
                         if journal:
                             # flush per file: the journal is only useful if it
                             # survives the kill that made us need it
-                            journal.write(c["path"] + "\n")
+                            journal.write(entry + "\n")
                             journal.flush()
                     except Exception as e:  # noqa: BLE001 — one bad file isn't fatal
                         note(f"  ! write failed: {c['path']} ({e})")

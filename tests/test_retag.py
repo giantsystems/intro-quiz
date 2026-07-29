@@ -32,21 +32,66 @@ def make_mp3(path: str, artist: str, title: str = "Song", album_artist: str | No
 
 def test_plan_prefers_album_artist_over_the_majority_vote():
     """A correct album_artist is direct evidence from the file itself; the
-    majority vote is only a fallback guess."""
+    majority vote is only a fallback guess.
+
+    Note the evidence is weighed for the GROUP, not per file: one file vouching
+    'AC/DC' via its album_artist carries the other four with it, even though
+    'ACDC' has the most files. Deciding per file is what used to let one plan
+    hold two targets at once — see
+    test_plan_never_emits_both_directions_for_one_artist.
+    """
     tracks = [
-        # 'a' disagrees with the majority, but its own album_artist knows better
         {"path": "a", "artist": "AC, DC", "album_artist": "AC/DC"},
         {"path": "b", "artist": "ACDC", "album_artist": None},
         {"path": "c", "artist": "ACDC", "album_artist": None},
         {"path": "d", "artist": "ACDC", "album_artist": None},
-        # 'e' has no album_artist to go on, so it falls back to the majority
         {"path": "e", "artist": "AC DC", "album_artist": None},
     ]
-    by_path = {c["path"]: c for c in retag.plan(tracks)}
-    assert by_path["a"]["target"] == "AC/DC" and by_path["a"]["why"] == "album_artist"
-    assert by_path["e"]["target"] == "ACDC", "majority wins where there's no album_artist"
-    assert by_path["e"]["why"] == "majority"
-    assert "b" not in by_path, "already the majority spelling — not a change"
+    changes = retag.plan(tracks)
+    assert {c["target"] for c in changes} == {"AC/DC"}, "one spelling for the whole group"
+    assert {c["why"] for c in changes} == {"album_artist"}
+    assert len(changes) == 5, "every file moves to the vouched spelling"
+
+
+def test_plan_never_emits_both_directions_for_one_artist():
+    """The real Suede shape, and the bug it caused.
+
+    11 files spelled 'suede' each carried album_artist='Suede'; the 2 files
+    already spelled 'Suede' had none, so per-file logic sent them to a majority
+    vote that 'suede' won on count. One run therefore wrote 11 files up to
+    'Suede' AND 2 files back down to 'suede'. On the live library 13 of 180
+    artists were self-contradictory like this and 45 files were written against
+    their own plan ('AC/DC' -> 'Ac/Dc' among them).
+    """
+    tracks = [{"path": f"s{i}", "artist": "suede", "album_artist": "Suede"} for i in range(11)]
+    tracks += [{"path": f"S{i}", "artist": "Suede", "album_artist": None} for i in range(2)]
+    changes = retag.plan(tracks)
+    assert {c["target"] for c in changes} == {"Suede"}, "one target for the whole group"
+    assert len(changes) == 11, "only the 11 misspelled files move"
+
+
+def test_plan_is_idempotent_on_a_mixed_group():
+    """Applying a plan and re-planning must find nothing left. This is the
+    property the per-file version broke: it converged only after a second pass,
+    having churned files in the meantime."""
+    tracks = [{"path": f"s{i}", "artist": "suede", "album_artist": "Suede"} for i in range(11)]
+    tracks += [{"path": f"S{i}", "artist": "Suede", "album_artist": None} for i in range(2)]
+    for c in retag.plan(tracks):                    # apply pass 1 in memory
+        next(t for t in tracks if t["path"] == c["path"])["artist"] = c["target"]
+    assert retag.plan(tracks) == [], "a second pass must have nothing to do"
+
+
+def test_plan_counts_album_artist_votes_across_the_group():
+    """When files disagree about the album artist too, the most-vouched spelling
+    wins — not whichever file happens to be visited first."""
+    tracks = [{"path": f"a{i}", "artist": "Beyonce", "album_artist": "Beyoncé"}
+              for i in range(10)]
+    tracks += [{"path": "b", "artist": "Beyonce", "album_artist": "Beyonce"}]
+    changes = retag.plan(tracks)
+    assert {c["target"] for c in changes} == {"Beyoncé"}, "10 votes beat 1"
+    # all 11 files are spelled 'Beyonce', so all 11 move — including the one whose
+    # own album_artist lost the vote
+    assert len(changes) == 11
 
 
 def test_plan_ignores_an_album_artist_for_a_different_act():
@@ -210,6 +255,48 @@ def test_write_is_journalled_so_a_rerun_resumes(monkeypatch, tmp_path):
     assert os.path.exists(retag._journal_path())
     # second pass: the tag is already right AND journalled — no work, no error
     assert retag.run(write=True)["written"] == 0
+
+
+@pytest.mark.skipif(not HAVE_FFMPEG, reason="needs ffmpeg to generate test MP3s")
+def test_the_journal_does_not_block_a_different_write_to_the_same_file(monkeypatch, tmp_path):
+    """The journal keyed on path alone skipped any file it had ever written, even
+    when the new plan wanted a DIFFERENT spelling — which is how a stale journal
+    blocked 21 corrections on the live library. It must skip only the exact write
+    it already performed."""
+    import mutagen
+    root = tmp_path / "lib"; root.mkdir()
+    make_mp3(str(root / "a.mp3"), "AC/DC", "One")
+    make_mp3(str(root / "b.mp3"), "AC/DC", "Two")
+    make_mp3(str(root / "c.mp3"), "AC, DC", "Three")
+    monkeypatch.setattr(retag, "MUSIC_DIRS", [str(root)])
+    monkeypatch.setattr(retag, "STATE_DIR", str(tmp_path))
+
+    assert retag.run(write=True)["written"] == 1
+    assert mutagen.File(str(root / "c.mp3"), easy=True)["artist"] == ["AC/DC"]
+
+    # c.mp3 is in the journal. Now an override wants a different spelling for it;
+    # the journal must not veto that.
+    out = retag.run(write=True, overrides={"AC/DC": "AC-DC"})
+    assert out["written"] == 3, "all three files move to the overridden spelling"
+    assert mutagen.File(str(root / "c.mp3"), easy=True)["artist"] == ["AC-DC"]
+
+
+@pytest.mark.skipif(not HAVE_FFMPEG, reason="needs ffmpeg to generate test MP3s")
+def test_a_write_run_converges_in_one_pass(monkeypatch, tmp_path):
+    """End-to-end idempotence on real files: after one write run, a dry run must
+    report nothing to do. The per-file planner needed two passes and churned
+    files in between."""
+    root = tmp_path / "lib"; root.mkdir()
+    # NOT 's0.mp3' / 'S0.mp3' — macOS is case-insensitive, so those are one file
+    for i in range(11):
+        make_mp3(str(root / f"lower{i}.mp3"), "suede", f"Song {i}", album_artist="Suede")
+    for i in range(2):
+        make_mp3(str(root / f"upper{i}.mp3"), "Suede", f"Other {i}")
+    monkeypatch.setattr(retag, "MUSIC_DIRS", [str(root)])
+    monkeypatch.setattr(retag, "STATE_DIR", str(tmp_path))
+
+    assert retag.run(write=True)["written"] == 11
+    assert retag.run(write=False)["changes"] == 0, "one pass must be enough"
 
 
 @pytest.mark.skipif(not HAVE_FFMPEG, reason="needs ffmpeg to generate test MP3s")

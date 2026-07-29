@@ -251,10 +251,17 @@ curl -X POST 'localhost:8000/api/library/retag?write=true'  # applies it
 
 The dry run returns the whole plan grouped by target spelling, with a per-file reason
 (`'AC, DC' x14 (by album_artist)`, `'AC-DC' x12 (by majority)`) — worth reading before
-applying. Per file it prefers, in order: the file's own `album_artist` when that folds to the
-same artist; otherwise the most-used spelling across the scan, tie-broken toward the longer
-string so `AC/DC` beats `ACDC`. A compilation's `album_artist` is ignored when it names a
-different act, which is what stops all 12 Blacklist covers being retagged as Metallica.
+applying. **One spelling is chosen per artist**, in order: an explicit override; the spelling
+most files vouch for via their own `album_artist`; otherwise the most-used spelling across the
+scan, tie-broken toward the longer string so `AC/DC` beats `ACDC`. A compilation's
+`album_artist` is ignored when it names a different act, which is what stops all 12 Blacklist
+covers being retagged as Metallica.
+
+Deciding per artist rather than per file is what makes a single pass enough. Weighing the
+evidence file-by-file could produce a plan holding *both* directions at once — files spelled
+`suede` carrying `album_artist=Suede` moved up while the files already spelled `Suede`, having
+no `album_artist`, fell through to a majority vote that `suede` won on count. A run then wrote
+some files up and others back down, and only settled on a second pass.
 
 **A leading "The" is never added or removed.** The artist key ignores it so that `The Verve`
 and `Verve` fold to one band — but that also means whichever spelling a file's `album_artist`
@@ -272,7 +279,9 @@ Two things it will not do:
 - **It never touches a library it can't see**, and previews unless you pass `write=true`.
 
 It's resumable in both phases — a scan cache keyed on mtime+size, and a write journal
-flushed per file — so a container restart mid-run costs seconds, not the whole pass. A
+flushed per file (recording *path plus the spelling written*, so a later run that wants a
+different spelling for that file isn't vetoed) — so a container restart mid-run costs seconds,
+not the whole pass. A
 22,000-file library scans in minutes from the server's local mount; the same scan over SMB
 from a laptop runs at ~8 files/s, which is why this belongs on the server. For the laptop
 equivalent, `scripts/retag_artists.py` takes `--root`, `--only`, `--map WRONG=RIGHT` and the
