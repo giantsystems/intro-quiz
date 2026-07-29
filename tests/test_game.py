@@ -601,6 +601,58 @@ def test_remote_flag_survives_a_reconnect_and_can_be_changed():
         conn.close(); os.unlink(p)
 
 
+def test_everyone_remote_only_when_there_is_someone_and_all_are_remote():
+    """Drives whether the house speaker is used at all: if nobody is in the room,
+    playing to it is noise in an empty room (and worse if someone's asleep near
+    it). Each remote phone plays its own copy, so nothing is lost."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=Clock())
+        assert g.everyone_remote() is False, "an empty lobby is not 'everyone remote'"
+
+        g.join("Away", remote=True)
+        assert g.everyone_remote() is True
+
+        g.join("Here")                      # one person in the room is enough
+        assert g.everyone_remote() is False
+
+        g.set_remote("Here", True)          # ...and they wandered off
+        assert g.everyone_remote() is True
+
+        g.set_remote("Away", False)         # ...while the other walked in
+        assert g.everyone_remote() is False
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_play_in_room_skips_the_speaker_for_a_board_or_an_all_remote_game():
+    """The single gate every in-game speaker call goes through. Two independent
+    reasons to stay silent, and either one alone is enough."""
+    from app import main
+
+    conn, p = make_db()
+    try:
+        hub = main.Hub()
+        hub.board_last_seen = 0.0        # no board has ever checked in
+        assert hub.play_in_room() is True, "no board, no game: the speaker is all there is"
+
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=Clock())
+        hub.game = g
+        assert hub.play_in_room() is True, "an empty lobby still gets room audio"
+
+        g.join("Away", remote=True)
+        assert hub.play_in_room() is False, "nobody in the room to hear it"
+
+        g.join("Here")
+        assert hub.play_in_room() is True, "one person in the room is enough"
+
+        import time as _t
+        hub.board_last_seen = _t.time()   # a board turned up and plays its own audio
+        assert hub.play_in_room() is False, "the board's audio would be doubled"
+    finally:
+        conn.close(); os.unlink(p)
+
+
 def test_note_audio_started_outside_a_question_is_a_no_op():
     conn, p = make_db()
     try:

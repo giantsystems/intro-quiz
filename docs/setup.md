@@ -138,6 +138,13 @@ Two things worth knowing:
   cast board. A remote player gets a "tap for sound" overlay on the first clip; one tap
   covers the rest of the game.
 
+**If every player is remote, the house speaker is skipped entirely.** There is nobody in
+the room to hear it, each phone plays its own copy, and the speaker may well be somewhere
+someone is asleep. The moment one player joins as *"in the room"* — or a remote player
+flips back — the speaker comes straight back for the next clip. A lobby with nobody in it
+yet is *not* treated as all-remote: the speaker is still used, on the assumption the host
+is about to walk in.
+
 Remote players are marked 🌐 on the scoreboard and in the lobby, so it's obvious who's
 listening on their own phone.
 
