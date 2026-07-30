@@ -408,8 +408,85 @@ function renderDisplays() {
   }
 }
 
+// -- round filters (idle screen) --------------------------------------------
+// Which genres/decades the picker offers, fetched once — it's library shape, not game
+// state, so it doesn't belong in the websocket snapshot every tick.
+let filterOpts = null;          // {genres:[{genre,tracks}], decades:[{decade,tracks}]}
+let pickedGenres = new Set();
+let pickedDecade = null;        // the decade's first year, e.g. 1990
+let countKey = "";              // dedupes the count fetch across repeated renders
+
+function loadFilterOpts() {
+  if (filterOpts) return;
+  filterOpts = {genres: [], decades: []};   // set first: a slow fetch must not queue more
+  fetch("/api/round-filters").then(r => r.json()).then(d => {
+    filterOpts = {genres: d.genres || [], decades: d.decades || []};
+    render();
+  }).catch(() => { filterOpts = null; });   // let the next render retry
+}
+
+function toggleGenre(g) {
+  if (pickedGenres.has(g)) pickedGenres.delete(g); else pickedGenres.add(g);
+  render();
+}
+
+function toggleDecade(d) {
+  pickedDecade = pickedDecade === d ? null : d;   // one decade at a time
+  render();
+}
+
+function renderFilters() {
+  const gbox = document.getElementById("genre-choice");
+  const dbox = document.getElementById("decade-choice");
+  const out = document.getElementById("filter-count");
+  if (state.phase !== "idle") { gbox.innerHTML = ""; dbox.innerHTML = ""; out.textContent = ""; return; }
+  loadFilterOpts();
+  gbox.innerHTML = "";
+  for (const g of (filterOpts ? filterOpts.genres : []).slice(0, 12)) {
+    const b = document.createElement("button");
+    b.textContent = (pickedGenres.has(g.genre) ? "✅ " : "") + g.genre + " (" + g.tracks + ")";
+    b.onclick = () => toggleGenre(g.genre);
+    gbox.appendChild(b);
+  }
+  dbox.innerHTML = "";
+  for (const d of (filterOpts ? filterOpts.decades : [])) {
+    const b = document.createElement("button");
+    b.textContent = (pickedDecade === d.decade ? "✅ " : "") + d.decade + "s";
+    b.onclick = () => toggleDecade(d.decade);
+    dbox.appendChild(b);
+  }
+  // The preflight. Genre and decade are each plausible while their INTERSECTION is empty,
+  // so the count is fetched for the actual combination rather than inferred from the two
+  // totals — and the Start button locks when it can't fill a game, instead of letting the
+  // server refuse at the moment of the tap.
+  const start = document.getElementById("start-game");
+  const key = [...pickedGenres].sort().join("|") + "/" + pickedDecade;
+  if (!pickedGenres.size && pickedDecade === null) {
+    out.textContent = ""; start.disabled = false; countKey = ""; return;
+  }
+  if (key === countKey) return;   // same choice, already counted — don't refetch per render
+  countKey = key;
+  const qs = "genres=" + encodeURIComponent([...pickedGenres].join("|"))
+           + (pickedDecade === null ? "" : "&year_from=" + pickedDecade + "&year_to=" + (pickedDecade + 9));
+  fetch("/api/round-filters/count?" + qs).then(r => r.json()).then(d => {
+    if (key !== countKey) return;   // a newer choice landed first
+    out.textContent = d.enough_for_10
+      ? d.tracks + " songs to choose from"
+      : "⚠️ only " + d.tracks + " songs — pick something wider";
+    start.disabled = !d.enough_for_10;
+  }).catch(() => { countKey = ""; });
+}
+
+function startGame() {
+  const msg = {type: "new_game", rounds: 10};
+  if (pickedGenres.size) msg.genres = [...pickedGenres];
+  if (pickedDecade !== null) { msg.year_from = pickedDecade; msg.year_to = pickedDecade + 9; }
+  send(msg);
+}
+
 function render() {
   renderDisplays();
+  renderFilters();
   renderWhere();
   renderAlltime();  // up here with the others: render() returns early on idle/join
   if (state.phase !== "question") timerKey = "";  // fresh countdown next round
@@ -424,6 +501,13 @@ function render() {
       ? '🎤 <b style="color:var(--accent)">You\'re the game master</b>'
       : `🎤 Game master: <b>${state.host}</b>`;
   } else mb.hidden = true;
+  // A themed game looks exactly like a normal one, so a player who doesn't know the round
+  // is 60s-only reads four modern-looking options as a bug. Say so, all game.
+  const tb = document.getElementById("theme-banner");
+  if (state.filter_label && state.phase !== "idle") {
+    tb.hidden = false;
+    tb.textContent = "🎯 " + state.filter_label;
+  } else tb.hidden = true;
   document.getElementById("abort-row").hidden = !((hostOnly || !hostJoined) && state.phase && state.phase !== "idle" && state.phase !== "finished");
   // Kill the cast on the active TV (#31) — but only AT THE END of a game, or when idle.
   // It used to sit under the master's thumb for the whole game, right beside the controls

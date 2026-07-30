@@ -20,6 +20,44 @@ ACTIONS: dict[str, dict] = {}   # name -> {"label": str, "run": callable}
 JOBS: dict[str, dict] = {}      # name -> status dict (see _fresh_status)
 _LOCK = threading.Lock()
 _CURRENT: list = [None]         # [name] of the running job, or [None]
+_CANCEL = threading.Event()     # set by abort(); cleared when a job starts
+
+
+class JobAborted(Exception):
+    """Raised by job code that notices cancelled() mid-run.
+
+    A job may also just RETURN early with a partial summary — both count as
+    aborted. Raising is for the deep call sites where returning something
+    summary-shaped would be a lie.
+    """
+
+
+def abort() -> tuple[bool, str | None]:
+    """Ask the running job to stop. Returns (asked, name).
+
+    COOPERATIVE, and it cannot be otherwise: the work is ffmpeg subprocesses,
+    HTTP fetches and sqlite writes on a daemon thread, and killing that thread
+    mid-write is how you get a half-cut clip recorded as done or a corrupt DB.
+    So this sets a flag the loops check between items, and the job stops at the
+    next safe boundary — usually under a second, but a clip cut in flight
+    finishes first (a ~10s download is the worst case).
+
+    Every job is resumable by design (each step only processes what's missing),
+    so an abort loses no completed work.
+    """
+    with _LOCK:
+        name = _CURRENT[0]
+        if name is None:
+            return False, None
+        _CANCEL.set()
+        JOBS[name]["abort_requested"] = True
+    LOGGER.warning("%s: abort requested", name)
+    return True, name
+
+
+def cancelled() -> bool:
+    """For job code to poll between items. Cheap — an Event flag read."""
+    return _CANCEL.is_set()
 
 
 def register(name: str, label: str, run: Callable[[Callable[[str], None]], dict]) -> None:
@@ -54,7 +92,8 @@ class RunLogHandler(logging.Handler):
 
 def _fresh_status() -> dict:
     return {"running": True, "stage": "starting", "started_at": time.time(),
-            "finished_at": None, "summary": None, "error": None, "log": []}
+            "finished_at": None, "summary": None, "error": None, "log": [],
+            "abort_requested": False, "aborted": False}
 
 
 def start(name: str) -> tuple[bool, dict]:
@@ -65,6 +104,10 @@ def start(name: str) -> tuple[bool, dict]:
     with _LOCK:
         if _CURRENT[0] is not None:
             return False, {"busy_with": _CURRENT[0], **JOBS.get(_CURRENT[0], {})}
+        # Cleared HERE rather than at the end of the aborted job: a stale flag
+        # would abort the next job instantly, and the previous run's thread may
+        # still be unwinding when this one starts.
+        _CANCEL.clear()
         _CURRENT[0] = name
         JOBS[name] = _fresh_status()
     threading.Thread(target=_run_wrapped, args=(name,), daemon=True).start()
@@ -86,7 +129,15 @@ def _run_wrapped(name: str) -> None:
     root.addHandler(handler)
     try:
         job["summary"] = ACTIONS[name]["run"](set_stage)
-        job["stage"] = "done"
+        # An aborted job usually RETURNS its partial summary rather than raising,
+        # so "did we stop early" is decided by the flag, not by the exception path.
+        # Otherwise a cancelled sweep would report a cheerful "done".
+        job["stage"] = "aborted" if cancelled() else "done"
+        job["aborted"] = cancelled()
+    except JobAborted as e:
+        LOGGER.warning("%s aborted: %s", name, e)
+        job["stage"] = "aborted"
+        job["aborted"] = True
     except Exception as e:  # noqa: BLE001 — status must always resolve
         LOGGER.exception("%s failed", name)
         job["error"] = str(e)

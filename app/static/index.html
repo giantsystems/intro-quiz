@@ -12,6 +12,7 @@
   <h1>🎵 Intro Quiz</h1>
   <div id="err"></div>
   <p class="center" id="master-banner" hidden style="margin:.2em 0 .8em"></p>
+  <p class="center dim" id="theme-banner" hidden style="margin:0 0 .8em;font-size:.9em"></p>
 
   <div id="v-howto" class="card" hidden>
     <p><b>How to play</b></p>
@@ -38,7 +39,11 @@
     <p>No game running.</p>
     <p class="dim">Show the board on:</p>
     <div id="display-choice"></div>
-    <button class="primary" onclick="send({type:'new_game', rounds:10})">Start a new game</button>
+    <p class="dim" style="margin-top:1.1em">Pick a theme, or leave it for the whole library:</p>
+    <div id="genre-choice" class="wall"></div>
+    <div id="decade-choice" class="wall" style="margin-top:.4em"></div>
+    <p class="center" id="filter-count" style="margin:.5em 0 .2em;font-size:.9em"></p>
+    <button class="primary" id="start-game" onclick="startGame()">Start a new game</button>
   </div>
 
   <button class="warn" id="stop-board-row" hidden style="margin-top:1.2rem" onclick="stopBoard();return false">🛑 Turn off the TV board</button>

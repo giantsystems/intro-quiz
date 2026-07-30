@@ -767,6 +767,310 @@ def test_a_null_duration_track_is_still_quizzable():
         conn.close(); os.unlink(p)
 
 
+# -- round filters (genre / decade) ----------------------------------------
+
+def _insert_f(conn, tid, artist, genre, year, tier="easy"):
+    conn.execute(
+        "INSERT INTO tracks(id,title,artist,album,genre,year,duration,tier,clipped_at,"
+        "global_listeners,active) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+        (tid, f"Song {tid}", artist, "Album", genre, year, 200, tier,
+         "2026-07-06T00:00:00", 5000))
+    conn.commit()
+
+
+def test_a_genre_filter_only_offers_that_genre():
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        for i in range(12):
+            _insert_f(conn, f"p{i}", f"Pop Act {i}", "Pop", 2005)
+        picked = game.pick_tracks(conn, 10, ["easy"], filters=game.filter_sql(["Rock"]))
+        assert {t["genre"] for t in picked} == {"Rock"}
+        assert len(picked) == 10
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_decade_filter_excludes_untagged_and_junk_years():
+    """You cannot honestly claim an untagged track belongs to the 90s, and the tags carry
+    real junk — AFI's 'Miss Murder' is tagged 1212 in this library. Both must be out of a
+    decade round rather than quietly padding it."""
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"n{i}", f"Nineties {i}", "Rock", 1993)
+        _insert_f(conn, "noyear", "No Year Band", "Rock", None)
+        _insert_f(conn, "junk", "Junk Year Band", "Rock", 1212)
+        _insert_f(conn, "later", "Later Band", "Rock", 2005)
+        picked = game.pick_tracks(conn, 12, ["easy"],
+                                  filters=game.filter_sql(None, 1990, 1999))
+        ids = {t["id"] for t in picked}
+        assert "noyear" not in ids and "junk" not in ids and "later" not in ids
+        assert len(ids) == 12
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_genres_match_exactly_so_rock_does_not_drag_in_four_other_genres():
+    """The tags are freeform — 70 distinct over the real pool, with 'Rock', 'Hard Rock',
+    'Alternative Rock' and 'Rock & Roll' all separate. A substring match on 'Rock' would
+    silently include genres nobody ticked."""
+    conn, p = make_db(0)
+    try:
+        for i in range(10):
+            _insert_f(conn, f"rock{i}", f"Rock Band {i}", "Rock", 1995)
+        for i in range(10):
+            _insert_f(conn, f"hard{i}", f"Hard Band {i}", "Hard Rock", 1995)
+        picked = game.pick_tracks(conn, 10, ["easy"], filters=game.filter_sql(["Rock"]))
+        assert {t["genre"] for t in picked} == {"Rock"}, "'Hard Rock' is a different genre"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_an_impossible_combination_fails_at_construction_not_mid_game():
+    """A filtered pool too small to fill the rounds must be refused up front, and the error
+    has to say the filters are why — 'only 2 tracks in tiers [easy]' sounds like a broken
+    library when the truth is 'Reggae in the 1960s is two songs'."""
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "a", "Reggae One", "Reggae", 1965)
+        _insert_f(conn, "b", "Reggae Two", "Reggae", 1968)
+        for i in range(20):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 2005)
+        with pytest.raises(game.GameError, match="filters"):
+            game.Game(conn, rounds=10, tiers=["easy"], genres=["Reggae"],
+                      year_from=1960, year_to=1969, clock=Clock())
+        # ...and the same library is perfectly fine unfiltered
+        game.Game(conn, rounds=10, tiers=["easy"], clock=Clock())
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_pool_count_is_the_preflight_the_ui_needs():
+    """Genre and decade are each plausible while their INTERSECTION is empty. Without a
+    count the only feedback was GameError at the moment someone tapped Start."""
+    conn, p = make_db(0)
+    try:
+        for i in range(10):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        for i in range(4):
+            _insert_f(conn, f"s{i}", f"Sixties Act {i}", "Pop", 1965)
+        assert game.pool_count(conn, ["easy"]) == 14
+        assert game.pool_count(conn, ["easy"], ["Rock"]) == 10
+        assert game.pool_count(conn, ["easy"], None, 1960, 1969) == 4
+        assert game.pool_count(conn, ["easy"], ["Rock"], 1960, 1969) == 0, "empty overlap"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_decoys_obey_the_filter_so_the_answer_does_not_stand_out():
+    """A fairness fix, not tidiness: in a 60s-only game three decoys drawn from the whole
+    library are recognisably modern, so the answer is the one old-sounding option and the
+    question is free."""
+    conn, p = make_db(0)
+    try:
+        for i in range(10):
+            _insert_f(conn, f"six{i}", f"Sixties Act {i}", "Rock", 1965)
+        for i in range(30):
+            _insert_f(conn, f"mod{i}", f"Modern Act {i}", "Pop", 2015)
+        answer = dict(conn.execute("SELECT * FROM tracks WHERE id='six0'").fetchone())
+        filters = game.filter_sql(None, 1960, 1969)
+        for _ in range(30):
+            decoys = game.pick_decoys(conn, answer, filters=filters)
+            assert all(d["artist"].startswith("Sixties") for d in decoys), decoys
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_real_filtered_game_builds_rounds_whose_options_are_all_on_theme():
+    """Covers the WIRING, not just pick_decoys: _mk_round has to pass the game's filters
+    down, and testing pick_decoys directly leaves that call site free to drop them.
+
+    Uses a GENRE filter with every track in the same year on purpose. pick_decoys has always
+    preferred the answer's own decade, so a decade-filtered game looks correct even with the
+    filters dropped — the pre-existing preference does the same job by accident. Genre is
+    the case where only the real wiring can save the round.
+    """
+    conn, p = make_db(0)
+    try:
+        for i in range(14):
+            _insert_f(conn, f"jz{i}", f"Jazz Act {i}", "Jazz", 1995)
+        for i in range(40):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        g = game.Game(conn, rounds=10, tiers=["easy"], genres=["Jazz"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        for rnd in g.rounds:
+            for o in rnd["options"]:
+                assert o["artist"].startswith("Jazz"), \
+                    f"a pop decoy makes the jazz answer obvious: {rnd['options']}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_decoys_widen_rather_than_fail_when_the_filter_is_too_narrow():
+    """Four options beat a failed round. A narrow filter may not hold enough DISTINCT
+    artists to fill the decoys, so the unfiltered pool is the fallback."""
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "only", "The Only Sixties Band", "Rock", 1965)
+        for i in range(30):
+            _insert_f(conn, f"mod{i}", f"Modern Act {i}", "Pop", 2015)
+        answer = dict(conn.execute("SELECT * FROM tracks WHERE id='only'").fetchone())
+        decoys = game.pick_decoys(conn, answer, filters=game.filter_sql(None, 1960, 1969))
+        assert len(decoys) == 3, "the round still gets four options"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_boost_round_falls_back_when_a_favourite_has_nothing_in_the_theme():
+    """A boost round is a bonus, not a promise: with filters on, a player's favourite
+    artists may have nothing in the chosen genre, and build_rounds just fills the slot
+    from the pool instead."""
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "jazz", "Miles Davis", "Jazz", 1959)
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        filters = game.filter_sql(["Rock"])
+        assert game.pick_artist_track(conn, ["Miles Davis"], set(), filters=filters) is None
+        g = game.Game(conn, rounds=10, tiers=["easy"], genres=["Rock"], clock=Clock())
+        g.join("Sam")
+        g.set_artists("Sam", ["Miles Davis"])
+        g.build_rounds(conn)
+        assert len(g.rounds) == 10, "the round list is still full"
+        assert all(r["track"]["genre"] == "Rock" for r in g.rounds)
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_filter_label_reads_like_a_person_wrote_it():
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        mk = lambda **kw: game.Game(conn, rounds=1, tiers=["easy"], clock=Clock(), **kw)
+        assert mk().filter_label() == "", "an unfiltered game says nothing"
+        assert mk(genres=["Rock"]).filter_label() == "Rock"
+        assert mk(year_from=1990, year_to=1999).filter_label() == "the 1990s"
+        assert mk(genres=["Rock"], year_from=1990, year_to=1999).filter_label() \
+            == "Rock · the 1990s"
+        assert mk(year_from=1985, year_to=1995).filter_label() == "1985–1995", \
+            "a span that isn't a decade reads as a range"
+        assert "filter_label" not in mk().snapshot(), \
+            "absent on an unfiltered game so existing UIs render exactly as before"
+        assert mk(genres=["Rock"]).snapshot()["filter_label"] == "Rock"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+# -- cross-game track history ----------------------------------------------
+
+def _played(conn, track_id, at):
+    conn.execute("INSERT INTO plays(track_id, played_at) VALUES(?,?)", (track_id, at))
+    conn.commit()
+
+
+def test_a_started_round_is_recorded_even_if_the_game_is_abandoned():
+    """Why the stamp is in start_round and not finish(): `abort` throws the game away
+    without ever calling finish, and an abandoned game's questions were still asked out
+    loud. Recording at start is the only point that knows a round really happened."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=3, tiers=["easy", "medium"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        first = g.start_round(conn)["track"]["id"]
+        g.reveal()
+        second = g.start_round(conn)["track"]["id"]
+        # ...and now the game is abandoned: no finish(), no games row
+        rows = [r["track_id"] for r in conn.execute("SELECT track_id FROM plays")]
+        assert rows == [first, second], "both asked rounds recorded, round 3 never asked"
+        assert conn.execute("SELECT COUNT(*) c FROM games").fetchone()["c"] == 0
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_start_round_without_a_conn_records_nothing_and_does_not_crash():
+    """The engine stays usable with no DB handle — 18 existing tests call start_round()
+    bare, and a missing history row must never be the thing that breaks a round."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=2, tiers=["easy", "medium"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        g.start_round()
+        assert conn.execute("SELECT COUNT(*) c FROM plays").fetchone()["c"] == 0
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_picker_prefers_tracks_that_have_not_been_played_lately():
+    conn, p = make_db(0)
+    try:
+        for i in range(6):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+        # t0..t3 all played; t4/t5 never
+        for i in range(4):
+            _played(conn, f"t{i}", f"2026-07-0{i + 1}T00:00:00")
+        for _ in range(30):
+            picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+            assert set(picked) == {"t4", "t5"}, f"fresh tracks must win outright: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_pool_smaller_than_the_history_still_fills_the_round():
+    """The reason recency SORTS instead of filtering. A hard exclude of everything played
+    looks equivalent on a 14,000-track library and fails outright on a small pool — which
+    a genre+decade filter can easily produce. Worst case we hand back the LEAST recently
+    asked repeats, which is what a human would do."""
+    conn, p = make_db(0)
+    try:
+        for i in range(3):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+            _played(conn, f"t{i}", f"2026-07-0{i + 1}T00:00:00")   # t2 = most recent
+        picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+        assert len(picked) == 2, "the round still fills — no GameError"
+        assert set(picked) == {"t0", "t1"}, f"the two stalest, not the freshest: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_recency_beats_nothing_when_a_track_was_played_twice():
+    """MAX(played_at) is what counts: an old favourite played again last night is as
+    recent as anything else, not still stale from its first outing."""
+    conn, p = make_db(0)
+    try:
+        for i in range(3):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+        _played(conn, "t0", "2026-01-01T00:00:00")   # long ago...
+        _played(conn, "t0", "2026-07-29T00:00:00")   # ...but again last night
+        _played(conn, "t1", "2026-02-01T00:00:00")
+        for _ in range(30):
+            assert [t["id"] for t in game.pick_tracks(conn, 1, ["easy"])] == ["t2"]
+        picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+        assert set(picked) == {"t2", "t1"}, f"t0 is the freshest play, so it goes last: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_boost_round_avoids_repeating_the_same_favourite_artist_track():
+    """This matters more than the main pool: a player picks the same three favourite
+    artists most weeks, so without a freshness preference their boost round is drawn from
+    a handful of tracks and lands on the same song every time."""
+    conn, p = make_db(0)
+    try:
+        _insert(conn, "old", "Highway To Hell", "AC/DC")
+        _insert(conn, "new", "Back In Black", "AC/DC")
+        _played(conn, "old", "2026-07-29T00:00:00")
+        for _ in range(30):
+            assert game.pick_artist_track(conn, ["AC/DC"], set())["id"] == "new"
+    finally:
+        conn.close(); os.unlink(p)
+
+
 def test_decoys_never_offer_two_spellings_of_the_same_band():
     """The other half of the variant problem: decoys are meant to be four
     DIFFERENT artists. 'Highway To Hell — AC/DC' plus 'Shoot To Thrill — AC, DC'

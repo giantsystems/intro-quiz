@@ -10,6 +10,8 @@ import time
 
 import httpx
 
+from . import jobs
+
 API_URL = "https://ws.audioscrobbler.com/2.0/"
 API_KEY = os.environ.get("LASTFM_API_KEY", "")
 DELAY_S = 0.25  # stay well under Last.fm's rate limit
@@ -166,6 +168,11 @@ def score_batch(conn, limit: int = 200, http: httpx.Client | None = None,
     done = errors = 0
     try:
         for row in rows:
+            # Per track: a full bootstrap makes ~14,000 of these lookups at 4/s,
+            # so a batch boundary alone would be a ~50s wait to honour an abort.
+            if jobs.cancelled():
+                LOGGER.warning("lastfm: aborted after %d lookup(s)", done)
+                break
             try:
                 listeners, playcount = lookup_best(http, row["artist"], row["title"])
             except (httpx.HTTPError, LastfmError) as e:

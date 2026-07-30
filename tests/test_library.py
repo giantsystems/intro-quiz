@@ -301,6 +301,25 @@ def test_deduping_first_saves_a_song_from_the_untrustworthy_rule():
         os.unlink(p)
 
 
+def test_clean_raises_when_aborted_rather_than_reporting_a_partial_audit():
+    """The finders run in a deliberate order, each seeing the previous one's bans
+    (see clean's docstring). Stopping half way leaves a partial clean-up, so it must
+    raise — a summary with only the finders that ran reads as a completed audit."""
+    from app import jobs
+    conn, p = make_db([{"id": "a"}])
+    jobs._CANCEL.set()
+    try:
+        try:
+            library.clean(conn)
+        except jobs.JobAborted as e:
+            assert "aborted" in str(e)
+        else:
+            raise AssertionError("an aborted clean-up must not return a summary")
+    finally:
+        jobs._CANCEL.clear()
+        os.unlink(p)
+
+
 def test_clean_rejects_an_unknown_reason():
     conn, p = make_db([{"id": "a"}])
     try:

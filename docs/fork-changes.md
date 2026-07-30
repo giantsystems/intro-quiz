@@ -75,6 +75,19 @@ job. It's the only part of the app that writes to the music library, so it's off
 Home Assistant and no Docker** — a seeded database of fake tracks with silent generated
 clips. See [development.md](development.md).
 
+### The websocket handler table
+
+`ws_endpoint` was a ~260-line `if/elif` over 15 message kinds, all of it reachable only
+through a live socket, and consequently untested. It's now a `HANDLERS` dict of
+`(session, msg)` coroutines with `tests/test_ws.py` calling them directly —
+see [development.md](development.md#the-websocket-protocol).
+
+Behaviour changed in one place, deliberately: a handler that needs a game and doesn't
+have one now returns a `GameError` the phone can display. Before, it raised
+`AttributeError` on `None` out of the socket loop and dropped the connection. **On a
+merge, keep the table** — the branch order in upstream's chain encodes nothing the flags
+don't say more clearly, and reverting loses every authority test with it.
+
 ---
 
 ## Deployment adaptations
@@ -85,18 +98,18 @@ These are specific to this deployment. They're the reason merging upstream needs
 
 | Change | Why |
 |---|---|
-| Published port `8001:8000` instead of `8000:8000` | Port 8000 on the server is Portainer. **Worth knowing when debugging:** curling `localhost:8000/health` there returns a bare `OK` from Portainer, which looks like a healthy app but isn't. |
+| Published port is `${QUIZ_PORT:-8000}:8000` | Another service (Portainer, in this deployment) may already hold 8000 on the host. Set `QUIZ_PORT` in `.env` to move it. **Worth knowing when debugging:** if something else does own 8000, curling `localhost:8000/health` can return a cheerful `OK` from *that* service, which looks like a healthy app but isn't — always curl the port you published. |
 | `:Z` on the `/data` and `/clips` mounts | SELinux is enforcing on AlmaLinux/RHEL; without relabelling the container can't write `/data`. Harmless on other hosts. |
-| `${MUSIC_HOST_DIR:-./data}:/music-src`, deliberately **without** `:Z` | The optional library mount for the retag job. `:Z` relabels the tree, which needs xattrs; the library is a CIFS share (`//nas.example.lan/music` at `/path/to/library`) and has none, so `:Z` there stops the container from starting. On this host the share also needs `sudo setsebool -P virt_use_samba on` — currently **off**, so the retag job can't see the library until it's set. |
+| `${MUSIC_HOST_DIR:-./data}:/music-src`, deliberately **without** `:Z` | The optional library mount for the retag job. `:Z` relabels the tree, which needs xattrs; where the library is a network share (CIFS/NFS) there are none, so `:Z` stops the container from starting. Such a host also needs `sudo setsebool -P virt_use_samba on` (CIFS) or `virt_use_nfs` (NFS), or the retag job can't see the library at all. |
 | `image:` points at `ghcr.io/giantsystems/intro-quiz` | This fork's tag. Nothing is pulled by default — it's just the local tag `--build` produces. |
-| `CLIPS_HOST_DIR` points at the server's local SSD | Clips are large and live on `/srv/fast-disk`, not on the NAS share. Falls back to `./clips` so a fresh checkout still works. |
+| `CLIPS_HOST_DIR` points at local disk | Clips are large (~2 MB/track), so they want fast local storage rather than a network share. Falls back to `./clips` so a fresh checkout still works. |
 
 ### No `.git` on the server
 
-The deployed copy at `$DEPLOY_PATH` is a plain rsync'd directory, so deploys
-are file syncs rather than `git pull`. Exclude `.env`, `data/` and `clips/` when syncing
-— `rsync --delete` without those exclusions would take out the config, the database and
-the clip library.
+The deployed copy is a plain rsync'd directory (`DEPLOY_HOST`/`DEPLOY_PATH` in `.env`, see
+[setup.md](setup.md)), so deploys are file syncs rather than `git pull`. Exclude `.env`,
+`data/` and `clips/` when syncing — `rsync --delete` without those exclusions would take
+out the config, the database and the clip library.
 
 ### Version numbering
 

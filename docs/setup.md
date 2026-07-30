@@ -48,6 +48,30 @@ run's log output. Set `ADMIN_PASSWORD` in `.env` to password-gate it — once
 set, scheduled curls must send `-H "X-Admin-Token: $ADMIN_PASSWORD"` as well;
 left unset, everything stays LAN-open as before.
 
+### One job at a time, and stopping one
+
+Only one maintenance job runs at a time — they all contend for the same SQLite
+database (and for ffmpeg and the network), so parallel runs would just fight.
+
+- **A refused start is HTTP 409**, with the name of the job holding the slot. Scripted
+  callers can rely on `curl -f` failing; previously a refusal came back as a `200` with
+  `started: false` in the body, so a job could silently not run.
+- **`POST /api/admin/abort` stops the running job** (or the **Abort** button, which is
+  the running job's own card button on `/admin`). 409 if nothing is running, so a script
+  can tell "stopped it" from "there was nothing to stop".
+
+Abort is **cooperative** and stops at the next safe boundary — between clips, between
+Last.fm lookups, between pipeline stages. Usually well under a second; the worst case is
+a clip download already in flight, so allow ~10s. It is deliberately not a thread kill:
+the work is ffmpeg subprocesses and SQLite writes, and interrupting one mid-write is how
+you get a half-cut clip recorded as finished.
+
+**Nothing completed is lost.** Every job only processes what's still missing, so a
+stopped job resumes where it left off — the admin page says `stopped … run again to
+resume` rather than reporting success. That makes Abort the answer to the awkward case
+where a multi-hour bootstrap or clip sweep is blocking the one job you actually want:
+stop it, run yours, start it again.
+
 ## Scan-to-join QR
 
 The cast board's waiting/lobby screens (and the phone lobby) show a QR of the
@@ -103,6 +127,33 @@ finishes. Notes:
 - Grouping is best-effort: if HA is unreachable at game start it's logged and the game
   plays on the single target rather than refusing to start.
 - One ticked speaker means no grouping — it's just the play target.
+
+## Themed games (genre and decade)
+
+The "start a new game" screen offers the genres and decades that actually hold enough
+quizzable tracks. Tap any number of genres and at most one decade; a live count sits under
+the pickers and **Start stays locked until the combination can fill a 10-round game**.
+Nothing to configure.
+
+Worth knowing:
+
+- The lists are built from the **quizzable** pool for the default tiers — a genre showing
+  56 is 56 tracks the quiz can really ask about, not 56 rows in the library. Anything under
+  25 tracks is left out entirely; with ~70 distinct genre tags most holding a handful of
+  tracks, showing them all would be a wall of dead options. Override with
+  `GET /api/round-filters?min_tracks=10` if you want a longer list.
+- Genres match the tag **exactly**. `Rock`, `Hard Rock`, `Alternative Rock` and
+  `Rock & Roll` are four separate options, because that's how the library is tagged — tick
+  several to widen.
+- Picking a decade also drops tracks with a **missing or junk year** (a few hundred have no
+  year at all, and one is tagged 1212), so a decade game is slightly smaller than the genre
+  count suggests. This is why the combined count is fetched rather than multiplied out.
+- The theme applies to **this game only**. `/health`, the artist wall and the tier counts
+  still describe the whole library.
+- A player's boost round stays **on theme too**, so a 1990s game has no stray 2015 track. If
+  none of their chosen artists has anything in the slice, they get an ordinary pool round
+  instead — a boost is a bonus, not a promise, and a themed game shouldn't refuse to start
+  because one person's favourites don't fit.
 
 ## All-time top scores
 
@@ -225,7 +276,7 @@ To enable it, mount the library read-write and name the roots as seen inside the
 
 ```ini
 # .env
-MUSIC_HOST_DIR=/path/to/library                 # host path, mounted at /music-src
+MUSIC_HOST_DIR=/path/to/library         # host path, mounted at /music-src
 MUSIC_DIRS="/music-src/music:/music-src/itunes/iTunes Music"
 ```
 

@@ -37,6 +37,7 @@ def test_tiers():
     conn, p = make_db([
         {"id": "fam", "play_count": 3, "global_listeners": 10},
         {"id": "star", "starred": 1, "global_listeners": 10},
+        {"id": "famous", "global_listeners": 1_500_000},
         {"id": "big", "global_listeners": 500_000},
         {"id": "mid", "global_listeners": 50_000},
         {"id": "obscure", "global_listeners": 12},
@@ -48,14 +49,77 @@ def test_tiers():
         counts = scoring.assign_tiers(conn)
         tiers = {x["id"]: x["tier"] for x in conn.execute("SELECT id, tier FROM tracks")}
         assert tiers["fam"] == "easy" and tiers["star"] == "easy"
+        assert tiers["famous"] == "easy", "the whole world knows it — no family data needed"
         assert tiers["big"] == "medium"
         assert tiers["mid"] == "hard"
         assert tiers["obscure"] == "tiebreak"
         assert tiers["nolastfm"] is None      # Last.fm never heard of it — not quizzable
         assert tiers["unscored"] is None
         assert tiers["gone"] is None          # inactive never tiered
-        assert counts == {"easy": 2, "medium": 1, "hard": 1, "tiebreak": 1}
+        assert counts == {"easy": 3, "medium": 1, "hard": 1, "tiebreak": 1}
     finally:
+        os.unlink(p)
+
+
+def test_easy_is_never_empty_on_a_library_with_no_family_play_data():
+    """The bug this guards: 'easy' used to mean family plays ALONE, and those columns are
+    only written by ingest_annotations() — which needs a hand-exported Navidrome dump and
+    is in no pipeline. On the live library play_count and starred were zero across all
+    23,083 rows, so 'easy' was empty... and the default game asks for ['easy','medium'].
+    Every game silently played medium-only.
+    """
+    conn, p = make_db([
+        {"id": f"hit{i}", "global_listeners": 2_000_000} for i in range(3)
+    ] + [
+        {"id": f"mid{i}", "global_listeners": 250_000} for i in range(2)
+    ])
+    try:
+        counts = scoring.assign_tiers(conn)
+        assert counts.get("easy") == 3, "famous tracks reach 'easy' with no annotations at all"
+        assert counts.get("medium") == 2
+    finally:
+        os.unlink(p)
+
+
+def test_family_plays_still_beat_the_listener_floor():
+    """The listener floor is a floor, not a replacement: a song the house plays on repeat is
+    'easy' however obscure the wider world finds it. Ingesting annotations only grows the tier.
+    """
+    conn, p = make_db([{"id": "deepcut", "play_count": 5, "global_listeners": 40}])
+    try:
+        scoring.assign_tiers(conn)
+        tier = conn.execute("SELECT tier FROM tracks WHERE id='deepcut'").fetchone()["tier"]
+        assert tier == "easy", "40 listeners, but the family knows it by heart"
+    finally:
+        os.unlink(p)
+
+
+def test_lastfm_batch_stops_mid_batch_when_aborted(monkeypatch):
+    """Checked per LOOKUP, not per batch: a bootstrap does ~14,000 of these at 4/s,
+    so waiting for a batch boundary would be a ~50s delay on every abort. The scores
+    already committed are kept — the next run only fetches what's still NULL."""
+    from app import jobs
+    monkeypatch.setattr(lastfm, "API_KEY", "test-key")
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["track"])
+        if len(seen) == 2:
+            jobs._CANCEL.set()      # abort lands after the second lookup
+        return httpx.Response(200, json={"track": {"listeners": "10", "playcount": "20"}})
+
+    conn, p = make_db([{"id": f"t{i}", "title": f"S{i}"} for i in range(8)])
+    try:
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        r = lastfm.score_batch(conn, http=http, delay_s=0)
+        assert len(seen) == 2, "kept fetching after the abort"
+        assert r["scored"] == 2
+        assert r["remaining"] == 6          # honest about what's left to do
+        # the two it did finish are committed, not rolled back
+        assert conn.execute("SELECT COUNT(*) c FROM tracks WHERE global_listeners IS NOT NULL"
+                            ).fetchone()["c"] == 2
+    finally:
+        jobs._CANCEL.clear()
         os.unlink(p)
 
 

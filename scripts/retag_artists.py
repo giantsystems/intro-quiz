@@ -5,12 +5,12 @@ app/library.artist_key), so this script is about the text players *see*: a
 scoreboard reading 'AC, DC' is wrong even when the quiz treats it correctly.
 
     # look, change nothing (start here)
-    python scripts/retag_artists.py --root "/path/to/itunes/iTunes Music" --dry-run
+    python scripts/retag_artists.py --root "/path/to/music" --dry-run
 
     # one artist at a time while you build trust
     python scripts/retag_artists.py --root ... --only "AC/DC" --write
 
-    # everything, both libraries
+    # everything, several library roots at once
     python scripts/retag_artists.py --root "/path/to/music" \
         --root "/path/to/itunes/iTunes Music" --write
 

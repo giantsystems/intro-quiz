@@ -6,6 +6,7 @@ import os
 import random
 import shutil
 import time
+from typing import Callable
 
 import httpx
 import segno
@@ -146,7 +147,70 @@ def api_stats():
             "with_family_score": conn.execute("SELECT COUNT(*) c FROM tracks WHERE play_count>0").fetchone()["c"],
             "with_global_score": conn.execute("SELECT COUNT(*) c FROM tracks WHERE global_listeners IS NOT NULL").fetchone()["c"],
             "tiered": conn.execute("SELECT tier, COUNT(*) c FROM tracks WHERE tier IS NOT NULL GROUP BY tier").fetchall(),
+            # how much of the library has actually been ASKED — the freshness history
+            # (see the `plays` table) gives this for free
+            "rounds_played": conn.execute("SELECT COUNT(*) c FROM plays").fetchone()["c"],
+            "distinct_tracks_played": conn.execute(
+                "SELECT COUNT(DISTINCT track_id) c FROM plays").fetchone()["c"],
         }
+    finally:
+        conn.close()
+
+
+@app.get("/api/round-filters")
+def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
+    """What a game can be narrowed to: genres and decades that hold enough tracks.
+
+    Feeds the "Start a new game" screen so a choice can't be made that then fails. The
+    counts are the honest quizzable pool for the DEFAULT tiers, so a genre showing 56 is 56
+    tracks the quiz can really ask about — not 56 rows in the library.
+
+    Anything under min_tracks is left out entirely rather than shown greyed: with 70 distinct
+    genres over the pool, most of them holding a handful of tracks, a full list would be a
+    wall of dead options. 25 is enough to build a 10-round game without the freshness
+    preference immediately handing back repeats.
+    """
+    tl = [t.strip() for t in tiers.split(",") if t.strip()]
+    if not tl:
+        return Response(status_code=400, content="tiers must not be empty")
+    conn = db.connect()
+    try:
+        qmarks = ",".join("?" * len(tl))
+        genres = [{"genre": r["genre"], "tracks": r["c"]} for r in conn.execute(
+            f"SELECT genre, COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} "
+            f"AND tier IN ({qmarks}) AND genre IS NOT NULL AND genre<>'' "
+            "GROUP BY genre HAVING c>=? ORDER BY c DESC", (*tl, min_tracks))]
+        # Decades come from the same pool. The year guard is game.YEAR_MIN/MAX rather than a
+        # bare "not null" because the tags carry real junk — a track dated 1212 would
+        # otherwise offer a "1210s" decade nobody can pick meaningfully.
+        decades = [{"decade": r["d"], "tracks": r["c"]} for r in conn.execute(
+            f"SELECT (year/10)*10 d, COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} "
+            f"AND tier IN ({qmarks}) AND year BETWEEN ? AND ? "
+            "GROUP BY d HAVING c>=? ORDER BY d DESC",
+            (*tl, game.YEAR_MIN, game.YEAR_MAX, min_tracks))]
+        return {"tiers": tl, "min_tracks": min_tracks,
+                "total": game.pool_count(conn, tl), "genres": genres, "decades": decades}
+    finally:
+        conn.close()
+
+
+@app.get("/api/round-filters/count")
+def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
+                            year_from: int | None = None, year_to: int | None = None):
+    """How many tracks a specific combination leaves — the preflight for a real choice.
+
+    Genres and decades are independently plausible and their INTERSECTION can still be
+    empty ('Reggae' has 56 tracks and the 1960s has 208; the overlap may be zero). Without
+    this the only feedback was GameError at the moment someone tapped Start.
+    """
+    tl = [t.strip() for t in tiers.split(",") if t.strip()]
+    gl = [g for g in (genres.split("|") if genres else []) if g]
+    if not tl:
+        return Response(status_code=400, content="tiers must not be empty")
+    conn = db.connect()
+    try:
+        n = game.pool_count(conn, tl, gl, year_from, year_to)
+        return {"tracks": n, "enough_for_10": n >= 10}
     finally:
         conn.close()
 
@@ -307,17 +371,34 @@ def _job_hygiene(set_stage) -> dict:
 
 def _job_bootstrap(set_stage) -> dict:
     """The whole first-time pipeline, resumable: each step only processes
-    what's missing, so re-running after a failure continues where it stopped."""
+    what's missing, so re-running after a failure continues where it stopped.
+
+    Abort is checked BETWEEN stages as well as inside each one. The inner loops
+    stop themselves, but without these guards an abort during `sync` would be
+    followed by hours of lastfm and clips anyway — which is the exact complaint
+    that made abort necessary.
+    """
     out: dict = {}
+
+    def stage(name: str) -> None:
+        if jobs.cancelled():
+            raise jobs.JobAborted(f"aborted before {name}")
+        set_stage(name)
+
     conn = db.connect()
     try:
-        set_stage("sync")
+        stage("sync")
         r = sync.sync_library(conn, subsonic.Client())
         out["tracks_synced"] = r.get("tracks_active")
-        set_stage("lastfm")
+        stage("lastfm")
         for _ in range(2000):
             r = lastfm.score_batch(conn, limit=200)
             out["lastfm_remaining"] = r["remaining"]
+            if jobs.cancelled():
+                # score_batch already stopped itself; the partial scores it did
+                # commit are kept and the next run picks up the rest.
+                out["aborted_at"] = "lastfm"
+                return out
             set_stage(f"lastfm — {r['remaining']} remaining")
             if r["remaining"] == 0:
                 break
@@ -326,16 +407,16 @@ def _job_bootstrap(set_stage) -> dict:
                                   "LASTFM_API_KEY / network, then run bootstrap "
                                   "again to resume where it left off")
                 break
-        set_stage("tiers")
+        stage("tiers")
         out["tiers"] = scoring.assign_tiers(conn)
         # Before clips, never after: every row banned here is a clip not cut, and
         # clip cutting is the expensive step (one Navidrome download each, hours
         # for a big library). Cleaning afterwards would mean paying for junk first.
-        set_stage("hygiene")
+        stage("hygiene")
         out["hygiene"] = library.clean(conn)["banned"]
     finally:
         conn.close()
-    set_stage("clips")
+    stage("clips")
     r = clips.sweep()
     out.update({"clips_cut": r.get("cut"), "clips_stopped": r.get("stopped")})
     return out
@@ -360,7 +441,12 @@ async def api_bootstrap():
     """
     started, st = jobs.start("bootstrap")
     if not started:
-        return {"started": False, "already_running": True, "status": st}
+        # 409, not 200. A refused start used to come back as a cheerful HTTP 200
+        # with started:false buried in the body, so `curl -f` in a cron and every
+        # "did it work?" glance said yes while nothing had been queued.
+        raise HTTPException(status_code=409,
+                            detail=f"busy with {st.get('busy_with')} — "
+                                   f"POST /api/admin/abort to stop it")
     return {"started": True, "watch": "/health"}
 
 
@@ -489,13 +575,15 @@ class Hub:
         return not self.board_expected() and not (self.game and self.game.everyone_remote())
 
     async def start_round(self):
-        if not self.game.rounds:
-            conn = db.connect()
-            try:
+        conn = db.connect()
+        try:
+            if not self.game.rounds:
                 self.game.build_rounds(conn)
-            finally:
-                conn.close()
-        rnd = self.game.start_round()
+            # conn passed so the round is recorded in `plays` — the cross-game history
+            # that keeps later games off songs we've just had
+            rnd = self.game.start_round(conn)
+        finally:
+            conn.close()
         if self.play_in_room():  # board plays its own audio; all-remote needs no room audio
             asyncio.get_event_loop().run_in_executor(None, ha.play_clip, rnd["track"]["id"], str(rnd["clip_len"]))
         self.cancel_deadline()
@@ -538,7 +626,7 @@ hub = Hub()
 TF_REVEAL_PAUSE_S = 2.0  # drumroll between the last T/F answer and the verdict
 
 
-async def reveal_tf_after_pause(game_obj, tf_index: int):
+async def reveal_tf_after_pause(hub, game_obj, tf_index: int):
     """Reveal the T/F verdict a beat after everyone has answered.
 
     Bails quietly if the game moved on meanwhile (host force-next, abort,
@@ -553,11 +641,383 @@ async def reveal_tf_after_pause(game_obj, tf_index: int):
     await hub.broadcast()
 
 
+def _trivia_topup() -> None:
+    """Refill the T/F pool in the background if it's running low."""
+    c = db.connect()
+    try:
+        trivia.topup_tf(c)
+    except Exception as e:  # noqa: BLE001 — opentdb down ≠ no game
+        LOGGER.warning("trivia topup failed: %s", e)
+    finally:
+        c.close()
+
+
+async def _finish_game(hub) -> None:
+    """The last round has been revealed: close the game out.
+
+    Fanfare, hand the speakers back, choose the next master, and let the board
+    drift to ambient — in that order, and all of it deferred rather than
+    immediate, because Play Again starts the next game inside this window.
+    """
+    conn = db.connect()
+    try:
+        hub.game.finish(conn)
+    finally:
+        conn.close()
+    if hub.play_in_room():  # board plays its own fanfare
+        asyncio.get_event_loop().run_in_executor(
+            None, ha.play_url, f"{ha.APP_BASE_URL}/static/fanfare.mp3", "fanfare")
+    # Hand the speakers back — deferred, like the board's drop-to-ambient below
+    # and for the same two reasons: ungrouping immediately would cut the fanfare
+    # off mid-note, and Play Again starts the next game inside this window,
+    # which wants the group left alone.
+    hub.schedule_ungroup()
+    # Rotate the game master: whoever has waited LONGEST.
+    #
+    # It used to rotate over the current game's join order — which is just who
+    # picked up their phone first, and it changes every game. Alice -> Bob ->
+    # Alice, and Carol was never once picked across the whole life of the app.
+    # (Worse: if the host wasn't in the list, ValueError -> i=-1 -> order[0] ->
+    # the role pinned itself to the fastest joiner.)
+    #
+    # Now: the outgoing master is stamped, and the next one is the present
+    # player who mastered least recently. Never mastered = first in the queue.
+    # Survives restarts, missed games and any join order.
+    present = list(hub.game.players)
+    if present:
+        conn = db.connect()
+        try:
+            hist = json.loads(db.get_setting(conn, "master_history") or "{}")
+            hist[hub.game.host] = int(time.time())    # stamp the outgoing master
+            hub.next_host = min(present, key=lambda n: (hist.get(n, 0), present.index(n)))
+            db.set_setting(conn, "master_history", json.dumps(hist))
+        finally:
+            conn.close()
+    # Drop the board to ambient 60s after the game — but ONLY if no new game has
+    # started by then. Back-to-back play (Play Again) begins the next game within
+    # that window; firing this quit unconditionally sent cast.quit_app() to the
+    # LIVE board mid-game-2 (~60s in = round 2) and killed it. Proven by adb
+    # logcat: a USER_REQUEST stop from our own IP at exactly finish+60s (#47).
+    loop = asyncio.get_event_loop()
+
+    def _to_ambient_if_idle(disp=hub.display):
+        if hub.game is None or hub.game.phase == "finished":
+            board_cast.hide_board(disp)
+    loop.call_later(60, lambda: loop.run_in_executor(None, _to_ambient_if_idle))
+    await hub.broadcast()
+
+
+# ---------------------------------------------------------------------------
+# The websocket protocol: one handler per message kind, in a table.
+#
+# This was a single 260-line if/elif chain reachable only through a live
+# websocket, which is why none of it had a test. Each handler is now a plain
+# coroutine taking (session, msg), so a test can call one directly against a
+# throwaway Hub and a stub socket.
+# ---------------------------------------------------------------------------
+
+class WSSession:
+    """One connected socket, plus the player name it has claimed.
+
+    The name lives here rather than as a local in ws_endpoint because handlers
+    both read and WRITE it: `join` claims it, and nearly everything else checks
+    it against the host. A dict of functions cannot rebind a caller's local, so
+    the mutable per-connection state has to be an object they share.
+    """
+
+    def __init__(self, ws, hub):
+        self.ws = ws
+        self.hub = hub
+        self.name: str | None = None
+
+    def who(self, msg: dict) -> str:
+        """The acting player: the name this socket joined as, else whoever the
+        message names (the board acts on a player's behalf)."""
+        return self.name or msg.get("name", "")
+
+    def require_host(self, what: str) -> None:
+        """Raise unless this socket is the game master. No master crowned yet
+        means anyone may act."""
+        g = self.hub.game
+        if g and g.host and self.name != g.host:
+            raise game.GameError(f"only {g.host} {what}")
+
+
+HANDLERS: dict[str, Callable] = {}
+QUIET_KINDS: set[str] = set()   # traffic that must not keep a stale game alive
+NEEDS_GAME: set[str] = set()    # handlers that dereference hub.game
+
+
+def handler(kind: str, *, counts_as_activity: bool = True, requires_game: bool = False):
+    """Register a websocket message handler.
+
+    counts_as_activity=False for pure liveness/plumbing traffic: a phone parked
+    on the display picker must not keep a finished game from expiring (#26).
+
+    requires_game=True is the guard the if/elif chain never had — most handlers
+    dereference hub.game, so a message arriving between games raised
+    AttributeError out of the socket loop and killed the connection, instead of
+    the error the phone knows how to show.
+    """
+    def register(fn):
+        HANDLERS[kind] = fn
+        if not counts_as_activity:
+            QUIET_KINDS.add(kind)
+        if requires_game:
+            NEEDS_GAME.add(kind)
+        return fn
+    return register
+
+
+@handler("ping", counts_as_activity=False)
+async def on_ping(s: WSSession, msg: dict) -> None:
+    """Liveness probe only (#50) — deliberately quiet, or an idle phone left on
+    the page keeps a stale game alive."""
+    await s.ws.send_json({"type": "pong"})
+
+
+@handler("set_display", counts_as_activity=False)
+async def on_set_display(s: WSSession, msg: dict) -> None:
+    want = msg.get("display")
+    if want in (board_cast.display_names() + ["none"]):
+        new = None if want == "none" else want
+        # quit the cast on the display we're leaving so a DashCast session never
+        # lingers/zombies on that TV (#31)
+        if s.hub.display and s.hub.display != new:
+            asyncio.get_event_loop().run_in_executor(None, board_cast.hide_board, s.hub.display)
+        s.hub.display = new
+        s.hub.cast_attempts = 0
+    await s.hub.broadcast()
+
+
+@handler("stop_board")
+async def on_stop_board(s: WSSession, msg: dict) -> None:
+    """Kill a stuck/zombie DashCast on demand and stand the watchdog down;
+    music falls back to the speaker (#31)."""
+    # Not require_host: a socket that never joined (the board itself) may turn
+    # its own board off. Only a *player* who isn't the master is refused.
+    if s.hub.game and s.hub.game.host and s.name and s.name != s.hub.game.host:
+        raise game.GameError(f"only {s.hub.game.host} can turn off the TV board")
+    if s.hub.display:
+        asyncio.get_event_loop().run_in_executor(None, board_cast.hide_board, s.hub.display)
+    s.hub.display = None
+    s.hub.cast_attempts = 999  # don't auto-recast for this game
+    await s.hub.broadcast()
+
+
+@handler("board_hello", counts_as_activity=False)
+async def on_board_hello(s: WSSession, msg: dict) -> None:
+    """Also the board's 15s heartbeat — liveness, not just registration."""
+    s.hub.boards.add(s.ws)
+    s.hub.board_last_seen = time.time()
+
+
+@handler("new_game")
+async def on_new_game(s: WSSession, msg: dict) -> None:
+    if s.hub.game and s.hub.game.phase not in ("finished", "lobby"):
+        raise game.GameError("a game is already running")
+    s.hub.host_ws = s.ws
+    if ha.house_is_sleeping() and not msg.get("force"):
+        raise game.GameError("house is Sleeping — start from the board to override")
+    conn = db.connect()
+    try:
+        s.hub.game = game.Game(
+            conn, rounds=int(msg.get("rounds", 10)),
+            tiers=msg.get("tiers") or ["easy", "medium"],
+            # round filters — absent/empty means the whole library
+            genres=msg.get("genres") or None,
+            year_from=msg.get("year_from"), year_to=msg.get("year_to"))
+        trivia.ensure_seeded(conn)
+    finally:
+        conn.close()
+    s.hub.games_started += 1
+    if s.hub.next_host:  # the master's chair rotates each game
+        s.hub.game.host = s.hub.next_host
+    asyncio.get_event_loop().run_in_executor(None, _trivia_topup)
+    # Cast the board ONLY if one isn't already up (#47). Our own receiver
+    # persists across games, so re-casting on every new_game just tore down a
+    # healthy board and reloaded it mid-transition — that was the "stuck after
+    # 10 rounds" between-games crash. The unconditional recast was a DashCast-era
+    # hack (its session died between games); ours doesn't, so a live board just
+    # gets the new lobby over its existing websocket. First game / no board -> cast.
+    if s.hub.display and not s.hub.board_expected():
+        asyncio.get_event_loop().run_in_executor(None, board_cast.show_board, s.hub.display, False)
+    # group the chosen speakers for the game (restored at the end)
+    await s.hub.group_speakers()
+    await s.hub.broadcast()
+
+
+@handler("join", requires_game=True)
+async def on_join(s: WSSession, msg: dict) -> None:
+    # Claimed BEFORE the join can fail: a rejected name still belongs to this
+    # socket, so its next message isn't silently attributed to nobody.
+    s.name = msg.get("name", "")
+    s.hub.game.join(s.name, remote=bool(msg.get("remote")))
+    if s.hub.game.host is None and s.ws is s.hub.host_ws:
+        s.hub.game.host = s.name.strip()[:24]
+    await s.hub.broadcast()
+
+
+@handler("set_remote", requires_game=True)
+async def on_set_remote(s: WSSession, msg: dict) -> None:
+    """Players can move: "I'm in the room" <-> "I'm remote"."""
+    s.hub.game.set_remote(s.who(msg), bool(msg.get("remote")))
+    await s.hub.broadcast()
+
+
+@handler("audio_started", requires_game=True)
+async def on_audio_started(s: WSSession, msg: dict) -> None:
+    """A remote phone's own copy of the clip just began — this is the baseline
+    its speed bonus is measured from. No broadcast: it changes nothing anyone
+    else can see, and it arrives once per remote player per round."""
+    s.hub.game.note_audio_started(s.who(msg))
+
+
+@handler("set_artists", requires_game=True)
+async def on_set_artists(s: WSSession, msg: dict) -> None:
+    s.hub.game.set_artists(s.who(msg), msg.get("artists") or [])
+    await s.hub.broadcast()
+
+
+@handler("ready", requires_game=True)
+async def on_ready(s: WSSession, msg: dict) -> None:
+    s.hub.game.set_ready(s.who(msg))
+    await s.hub.broadcast()
+
+
+@handler("start_round", requires_game=True)
+async def on_start_round(s: WSSession, msg: dict) -> None:
+    g = s.hub.game
+    if g.host is None and s.name:
+        g.host = s.name  # starter never joined from that socket — first driver takes the wheel
+    if g.host and s.name != g.host:
+        if g.phase == "lobby" and g.host not in g.players:
+            g.host = s.name  # rotated master isn't playing — presser takes over
+        else:
+            raise game.GameError(f"only {g.host} controls the rounds")
+    if g.phase == "lobby":
+        waiting = g.waiting_on()
+        if waiting:
+            raise game.GameError("not everyone is ready: " + ", ".join(waiting))
+    await s.hub.start_round()
+
+
+@handler("extend_clip", requires_game=True)
+async def on_extend_clip(s: WSSession, msg: dict) -> None:
+    length = s.hub.game.extend_clip()
+    # the window moved out with the longer clip — move the reveal too
+    s.hub.cancel_deadline()
+    s.hub.deadline_task = asyncio.create_task(s.hub._deadline(s.hub.game.window_left()))
+    if s.hub.play_in_room():
+        asyncio.get_event_loop().run_in_executor(
+            None, ha.play_clip, s.hub.game.rounds[s.hub.game.current]["track"]["id"], str(length))
+    await s.hub.broadcast()
+
+
+@handler("answer", requires_game=True)
+async def on_answer(s: WSSession, msg: dict) -> None:
+    s.hub.game.answer(s.who(msg), int(msg["choice"]))
+    await s.hub.maybe_early_reveal()
+    await s.hub.broadcast()
+
+
+@handler("flag_clip", requires_game=True)
+async def on_flag_clip(s: WSSession, msg: dict) -> None:
+    s.require_host("can flag clips")
+    conn = db.connect()
+    try:
+        s.hub.game.flag_current(conn)
+    finally:
+        conn.close()
+    if s.hub.game.phase == "question":
+        # a flagged clip isn't worth guessing — end the round now
+        s.hub.cancel_deadline()
+        await s.hub._reveal()
+    await s.hub.broadcast()
+
+
+@handler("abort")
+async def on_abort(s: WSSession, msg: dict) -> None:
+    # Only a PRESENT host owns the abandon. If the rotated master isn't in the
+    # game (crowned absent), anyone can abandon it — mirrors the take-over start
+    # rule, so an orphaned game can't get stuck unabandonable from every phone
+    # (#46). No requires_game: aborting with no game still resets the board.
+    g = s.hub.game
+    host_present = bool(g and g.host in g.players)
+    if g and g.host and s.name != g.host and host_present:
+        raise game.GameError(f"only {g.host} can abandon the game")
+    s.hub.cancel_deadline()
+    s.hub.game = None
+    asyncio.get_event_loop().run_in_executor(None, board_cast.hide_board, s.hub.display)
+    await s.hub.ungroup_speakers()
+    await s.hub.broadcast()
+
+
+@handler("tf_answer", requires_game=True)
+async def on_tf_answer(s: WSSession, msg: dict) -> None:
+    g = s.hub.game
+    g.tf_answer(s.who(msg), bool(msg.get("answer")))
+    if g.tf_all_answered():
+        # everyone's in — hold a 2s drumroll before the verdict (an instant flip
+        # read as "the TV knew early" to guests)
+        asyncio.create_task(reveal_tf_after_pause(s.hub, g, g.tf_index))
+    await s.hub.broadcast()
+
+
+@handler("next", requires_game=True)
+async def on_next(s: WSSession, msg: dict) -> None:
+    g = s.hub.game
+    s.require_host("controls the rounds")
+    wait = g.payoff_wait()
+    if wait > 0:  # only guards the reveal from being skipped unread
+        raise game.GameError(f"hold on — showing the answer ({int(wait) + 1}s)")
+    if g.phase == "break":
+        if g.advance_break() == "resume":
+            await s.hub.start_round()
+        else:
+            await s.hub.broadcast()
+    elif g.phase == "reveal" and g.is_halfway() and not g.is_last_round():
+        conn = db.connect()
+        try:
+            g.start_break(conn)
+        finally:
+            conn.close()
+        await s.hub.broadcast()
+    elif g.phase == "reveal" and g.is_last_round():
+        await _finish_game(s.hub)
+    else:
+        await s.hub.start_round()
+
+
+async def dispatch(s: WSSession, msg: dict) -> None:
+    """Route one message to its handler. The caller holds hub.lock.
+
+    An unknown kind is ignored rather than an error: phones cache across
+    deploys, so a retired message type outliving its handler is normal.
+    """
+    kind = msg.get("type")
+    if kind not in QUIET_KINDS:
+        # phones are actively playing: stale-game clock and the watchdog's
+        # re-cast budget both reset (#26). Unknown kinds count too — an old
+        # phone speaking a retired dialect is still a phone in the room.
+        s.hub.last_activity = time.time()
+        s.hub.cast_attempts = 0
+    fn = HANDLERS.get(kind)
+    if fn is None:
+        return
+    try:
+        if kind in NEEDS_GAME and not s.hub.game:
+            raise game.GameError("no game — start one first")
+        await fn(s, msg)
+    except game.GameError as e:
+        await s.ws.send_json({"type": "error", "message": str(e)})
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket):
     await ws.accept()
     hub.sockets.append(ws)
-    name = None
+    s = WSSession(ws, hub)
     try:
         snap = hub.game.snapshot() if hub.game else {"phase": "idle"}
         await ws.send_json({**snap, "type": "state",
@@ -566,244 +1026,7 @@ async def ws_endpoint(ws: WebSocket):
         while True:
             msg = await ws.receive_json()
             async with hub.lock:
-                try:
-                    kind = msg.get("type")
-                    if kind == "ping":
-                        # liveness probe only (#50) — must not touch last_activity,
-                        # or an idle phone left on the page keeps a stale game alive
-                        await ws.send_json({"type": "pong"})
-                        continue
-                    if kind not in ("board_hello", "set_display"):
-                        # phones are actively playing: stale-game clock and the
-                        # watchdog's re-cast budget both reset (#26)
-                        import time as _t
-                        hub.last_activity = _t.time()
-                        hub.cast_attempts = 0
-                    if kind == "set_display":
-                        want = msg.get("display")
-                        if want in (board_cast.display_names() + ["none"]):
-                            new = None if want == "none" else want
-                            # quit the cast on the display we're leaving so a
-                            # DashCast session never lingers/zombies on that TV (#31)
-                            if hub.display and hub.display != new:
-                                asyncio.get_event_loop().run_in_executor(
-                                    None, board_cast.hide_board, hub.display)
-                            hub.display = new
-                            hub.cast_attempts = 0
-                        await hub.broadcast()
-                    elif kind == "stop_board":
-                        # kill a stuck/zombie DashCast on demand and stand the
-                        # watchdog down; music falls back to the speaker (#31)
-                        if hub.game and hub.game.host and name and name != hub.game.host:
-                            raise game.GameError(f"only {hub.game.host} can turn off the TV board")
-                        if hub.display:
-                            asyncio.get_event_loop().run_in_executor(
-                                None, board_cast.hide_board, hub.display)
-                        hub.display = None
-                        hub.cast_attempts = 999  # don't auto-recast for this game
-                        await hub.broadcast()
-                    elif kind == "board_hello":
-                        # also the board's 15s heartbeat — liveness, not just registration
-                        hub.boards.add(ws)
-                        import time as _t
-                        hub.board_last_seen = _t.time()
-                    elif kind == "new_game":
-                        if hub.game and hub.game.phase not in ("finished", "lobby"):
-                            raise game.GameError("a game is already running")
-                        hub.host_ws = ws
-                        if ha.house_is_sleeping() and not msg.get("force"):
-                            raise game.GameError("house is Sleeping — start from the board to override")
-                        conn = db.connect()
-                        try:
-                            hub.game = game.Game(conn, rounds=int(msg.get("rounds", 10)),
-                                                 tiers=msg.get("tiers") or ["easy", "medium"])
-                            trivia.ensure_seeded(conn)
-                        finally:
-                            conn.close()
-                        hub.games_started += 1
-                        if hub.next_host:  # the master's chair rotates each game
-                            hub.game.host = hub.next_host
-                        # refill the T/F pool in the background if it's running low
-
-                        def _topup():
-                            c = db.connect()
-                            try:
-                                trivia.topup_tf(c)
-                            except Exception as e:  # noqa: BLE001 — opentdb down ≠ no game
-                                LOGGER.warning("trivia topup failed: %s", e)
-                            finally:
-                                c.close()
-                        asyncio.get_event_loop().run_in_executor(None, _topup)
-                        # Cast the board ONLY if one isn't already up (#47). Our own
-                        # receiver persists across games, so re-casting on every new_game
-                        # just tore down a healthy board and reloaded it mid-transition —
-                        # that was the "stuck after 10 rounds" between-games crash. The
-                        # unconditional recast was a DashCast-era hack (its session died
-                        # between games); ours doesn't, so a live board just gets the new
-                        # lobby over its existing websocket. First game / no board -> cast.
-                        if hub.display and not hub.board_expected():
-                            asyncio.get_event_loop().run_in_executor(None, board_cast.show_board, hub.display, False)
-                        # group the chosen speakers for the game (restored at the end)
-                        await hub.group_speakers()
-                        await hub.broadcast()
-                    elif kind == "join":
-                        if not hub.game:
-                            raise game.GameError("no game — start one first")
-                        name = msg.get("name", "")
-                        hub.game.join(name, remote=bool(msg.get("remote")))
-                        if hub.game.host is None and ws is hub.host_ws:
-                            hub.game.host = name.strip()[:24]
-                        await hub.broadcast()
-                    elif kind == "set_remote":
-                        # players can move: "I'm in the room" <-> "I'm remote"
-                        hub.game.set_remote(name or msg.get("name", ""), bool(msg.get("remote")))
-                        await hub.broadcast()
-                    elif kind == "audio_started":
-                        # a remote phone's own copy of the clip just began — this is
-                        # the baseline its speed bonus is measured from. No broadcast:
-                        # it changes nothing anyone else can see, and it arrives once
-                        # per remote player per round.
-                        hub.game.note_audio_started(name or msg.get("name", ""))
-                    elif kind == "set_artists":
-                        hub.game.set_artists(name or msg.get("name", ""), msg.get("artists") or [])
-                        await hub.broadcast()
-                    elif kind == "ready":
-                        hub.game.set_ready(name or msg.get("name", ""))
-                        await hub.broadcast()
-                    elif kind == "start_round":
-                        if hub.game.host is None and name:
-                            hub.game.host = name  # starter never joined from that socket — first driver takes the wheel
-                        if hub.game.host and name != hub.game.host:
-                            if hub.game.phase == "lobby" and hub.game.host not in hub.game.players:
-                                hub.game.host = name  # rotated master isn't playing — presser takes over
-                            else:
-                                raise game.GameError(f"only {hub.game.host} controls the rounds")
-                        if hub.game.phase == "lobby":
-                            waiting = hub.game.waiting_on()
-                            if waiting:
-                                raise game.GameError("not everyone is ready: " + ", ".join(waiting))
-                        await hub.start_round()
-                    elif kind == "extend_clip":
-                        length = hub.game.extend_clip()
-                        # the window moved out with the longer clip — move the reveal too
-                        hub.cancel_deadline()
-                        hub.deadline_task = asyncio.create_task(hub._deadline(hub.game.window_left()))
-                        if hub.play_in_room():
-                            asyncio.get_event_loop().run_in_executor(
-                                None, ha.play_clip, hub.game.rounds[hub.game.current]["track"]["id"], str(length))
-                        await hub.broadcast()
-                    elif kind == "answer":
-                        hub.game.answer(name or msg.get("name", ""), int(msg["choice"]))
-                        await hub.maybe_early_reveal()
-                        await hub.broadcast()
-                    elif kind == "flag_clip":
-                        if hub.game.host and name != hub.game.host:
-                            raise game.GameError(f"only {hub.game.host} can flag clips")
-                        conn = db.connect()
-                        try:
-                            hub.game.flag_current(conn)
-                        finally:
-                            conn.close()
-                        if hub.game.phase == "question":
-                            # a flagged clip isn't worth guessing — end the round now
-                            hub.cancel_deadline()
-                            await hub._reveal()
-                        await hub.broadcast()
-                    elif kind == "abort":
-                        # Only a PRESENT host owns the abandon. If the rotated master
-                        # isn't in the game (crowned absent), anyone can abandon it —
-                        # mirrors the take-over start rule, so an orphaned game can't
-                        # get stuck unabandonable from every phone (#46).
-                        host_present = bool(hub.game and hub.game.host in hub.game.players)
-                        if hub.game and hub.game.host and name != hub.game.host and host_present:
-                            raise game.GameError(f"only {hub.game.host} can abandon the game")
-                        hub.cancel_deadline()
-                        hub.game = None
-                        asyncio.get_event_loop().run_in_executor(None, board_cast.hide_board, hub.display)
-                        await hub.ungroup_speakers()
-                        await hub.broadcast()
-                    elif kind == "tf_answer":
-                        hub.game.tf_answer(name or msg.get("name", ""), bool(msg.get("answer")))
-                        if hub.game.tf_all_answered():
-                            # everyone's in — hold a 2s drumroll before the verdict
-                            # (an instant flip read as "the TV knew early" to guests)
-                            asyncio.create_task(reveal_tf_after_pause(hub.game, hub.game.tf_index))
-                        await hub.broadcast()
-                    elif kind == "next":
-                        if hub.game.host and name != hub.game.host:
-                            raise game.GameError(f"only {hub.game.host} controls the rounds")
-                        wait = hub.game.payoff_wait()
-                        if wait > 0:  # only guards the reveal from being skipped unread
-                            raise game.GameError(f"hold on — showing the answer ({int(wait) + 1}s)")
-                        if hub.game.phase == "break":
-                            if hub.game.advance_break() == "resume":
-                                await hub.start_round()
-                            else:
-                                await hub.broadcast()
-                        elif hub.game.phase == "reveal" and hub.game.is_halfway() and not hub.game.is_last_round():
-                            conn = db.connect()
-                            try:
-                                hub.game.start_break(conn)
-                            finally:
-                                conn.close()
-                            await hub.broadcast()
-                        elif hub.game.phase == "reveal" and hub.game.is_last_round():
-                            conn = db.connect()
-                            try:
-                                hub.game.finish(conn)
-                            finally:
-                                conn.close()
-                            if hub.play_in_room():  # board plays its own fanfare
-                                asyncio.get_event_loop().run_in_executor(
-                                    None, ha.play_url,
-                                    f"{ha.APP_BASE_URL}/static/fanfare.mp3", "fanfare")
-                            # Hand the speakers back — deferred, like the board's
-                            # drop-to-ambient below and for the same two reasons:
-                            # ungrouping immediately would cut the fanfare off
-                            # mid-note, and Play Again starts the next game inside
-                            # this window, which wants the group left alone.
-                            hub.schedule_ungroup()
-                            # Rotate the game master: whoever has waited LONGEST.
-                            #
-                            # It used to rotate over the current game's join order — which
-                            # is just who picked up their phone first, and it changes every
-                            # game. Alice -> Bob -> Alice, and Carol was never once picked
-                            # across the whole life of the app. (Worse: if the host wasn't
-                            # in the list, ValueError -> i=-1 -> order[0] -> the role pinned
-                            # itself to the fastest joiner.)
-                            #
-                            # Now: the outgoing master is stamped, and the next one is the
-                            # present player who mastered least recently. Never mastered =
-                            # first in the queue. Survives restarts, missed games and any
-                            # join order.
-                            present = list(hub.game.players)
-                            if present:
-                                conn = db.connect()
-                                try:
-                                    hist = json.loads(db.get_setting(conn, "master_history") or "{}")
-                                    hist[hub.game.host] = int(time.time())    # stamp the outgoing master
-                                    hub.next_host = min(
-                                        present,
-                                        key=lambda n: (hist.get(n, 0), present.index(n)))
-                                    db.set_setting(conn, "master_history", json.dumps(hist))
-                                finally:
-                                    conn.close()
-                            # Drop the board to ambient 60s after the game — but ONLY if no
-                            # new game has started by then. Back-to-back play (Play Again)
-                            # begins the next game within that window; firing this quit
-                            # unconditionally sent cast.quit_app() to the LIVE board mid-game-2
-                            # (~60s in = round 2) and killed it. Proven by adb logcat: a
-                            # USER_REQUEST stop from our own IP at exactly finish+60s (#47).
-                            loop = asyncio.get_event_loop()
-                            def _to_ambient_if_idle(disp=hub.display):
-                                if hub.game is None or hub.game.phase == "finished":
-                                    board_cast.hide_board(disp)
-                            loop.call_later(60, lambda: loop.run_in_executor(None, _to_ambient_if_idle))
-                            await hub.broadcast()
-                        else:
-                            await hub.start_round()
-                except game.GameError as e:
-                    await ws.send_json({"type": "error", "message": str(e)})
+                await dispatch(s, msg)
     except WebSocketDisconnect:
         pass
     finally:
@@ -812,6 +1035,7 @@ async def ws_endpoint(ws: WebSocket):
         if ws in hub.boards:
             hub.boards.discard(ws)
             # re-casting is handled by the periodic board watchdog (#21) —
+            # a clean disconnect just means it notices within one tick
             # a clean disconnect just means it notices within one tick
 
 
@@ -971,6 +1195,19 @@ def api_admin_run(name: str):
     if not started:
         raise HTTPException(status_code=409, detail=f"busy with {st.get('busy_with')}")
     return {"started": True, "job": name}
+
+
+@app.post("/api/admin/abort", dependencies=ADMIN)
+def api_admin_abort():
+    """Ask the running maintenance job to stop at its next safe boundary.
+
+    409 when nothing is running, so a script can tell "stopped it" from "there
+    was nothing to stop" — same reasoning as run's 409 on a busy server.
+    """
+    asked, name = jobs.abort()
+    if not asked:
+        raise HTTPException(status_code=409, detail="no job is running")
+    return {"aborting": name}
 
 
 @app.post("/api/admin/game/abandon", dependencies=ADMIN)
@@ -1315,7 +1552,9 @@ def api_library_retag(write: bool = False):
                         content=json.dumps({"error": "MUSIC_DIRS is not set — see docs/setup.md"}))
     started, st = jobs.start("retag_write" if write else "retag")
     if not started:
-        return {"started": False, "already_running": True, "status": st}
+        raise HTTPException(status_code=409,
+                            detail=f"busy with {st.get('busy_with')} — "
+                                   f"POST /api/admin/abort to stop it")
     return {"started": True, "write": write, "watch": "/admin"}
 
 
@@ -1335,7 +1574,12 @@ def api_ban_album(pattern: str):
 @app.post("/api/leaderboard/reset", dependencies=ADMIN)
 def api_leaderboard_reset(confirm: str = ""):
     """Wipe the all-time leaderboard (games + results). Deliberately API-only —
-    no button in the family UI. Requires ?confirm=yes."""
+    no button in the family UI. Requires ?confirm=yes.
+
+    The `plays` history is deliberately NOT wiped: it isn't score data, and clearing it
+    would make the next few games repeat songs we've just had. Resetting the scoreboard
+    is about scores.
+    """
     if confirm != "yes":
         return Response(status_code=400,
                         content="add ?confirm=yes to wipe the all-time leaderboard")

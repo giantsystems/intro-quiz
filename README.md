@@ -110,8 +110,11 @@ subscriptions.
   SQLite (tracks, artists, durations).
 - **Recognisability scoring** — two signals per track: *family* (Navidrome play
   counts + stars) and *global* (Last.fm listeners via `track.getInfo`). Blended into
-  difficulty tiers: your favourites are "easy"; world-famous songs you own but never
-  play are "medium" — the sweet spot where everyone has a chance.
+  difficulty tiers: your favourites are "easy", as are the handful of songs *everyone*
+  knows (1M+ Last.fm listeners); world-famous songs you own but never play are "medium"
+  — the sweet spot where everyone has a chance. The listener floor matters because the
+  family signal needs a hand-exported Navidrome dump: without one, "easy" would be
+  empty, and the default game asks for easy+medium.
 - **Library hygiene** — real libraries have three problems that all look like
   "duplicates", and they need opposite treatment. *Variant spellings* (`AC/DC`, `AC, DC`,
   `AC DC`) are **folded, never deleted**: one normalised artist key means the quiz sees one
@@ -145,7 +148,28 @@ subscriptions.
   is recognised rather than fed to ffmpeg.
 - **The game engine** — one websocket hub (FastAPI), phases lobby → question → reveal.
   Rounds are built lazily at first start so artist picks land first. Answer timing is
-  server-side; the correct answer never ships to clients before the reveal.
+  server-side; the correct answer never ships to clients before the reveal. Every
+  message kind (`join`, `answer`, `next`, …) is a registered handler rather than a
+  branch of one long chain, so the rules about *who may do what* — only the master
+  starts rounds, only a **present** master can abandon a game — are unit-tested
+  instead of only reachable through a live socket. A message arriving between games
+  now gets a readable error rather than dropping the connection.
+- **No repeats between games** — every round that actually gets asked is stamped in a
+  `plays` table, and the picker prefers songs it hasn't played in the last ~200 rounds
+  (about 20 games). It's a *preference*, not a filter: on a pool too small to avoid
+  repeats it hands back the least-recently-asked songs rather than refusing to start.
+  A player's boost round gets the same treatment, which matters more — the same three
+  favourite artists every week would otherwise land on the same song. Rounds from an
+  **abandoned** game count too: they were still asked out loud.
+- **Themed rounds** — before starting, pick one or more **genres** and/or a **decade**
+  ("Rock · the 1990s"), and the whole game is drawn from that slice. Only choices with
+  enough tracks behind them are offered, and the *combination* is counted live before
+  Start unlocks — genres and decades are each plausible while their overlap is empty, and
+  the old failure mode was an error at the moment someone tapped Start. The decoys obey
+  the theme as well: three modern wrong answers next to a 60s right one gives the game
+  away, so a themed round widens its decoy search rather than breaking the illusion.
+  The filter narrows *this game only* — `/health` and the artist wall still measure the
+  whole library. The theme shows on the board and on every phone.
 - **The TV board** — a second web page cast to the display via DashCast
   (pychromecast). The board **plays the round audio itself** through the Web Audio API
   (one audio context for the whole game) — casting clips as media would evict the
@@ -199,7 +223,13 @@ subscriptions.
   step to get told when new tracks look mis-tagged (see Notes). Clips cost ~2 MB per track.
 - **Server control page** — `/admin` runs any of those maintenance actions from
   the browser instead: one job at a time, live progress while it runs, the run's
-  log output, and each action's last outcome. It also shows the running game
+  log output, and each action's last outcome. The running job's button becomes
+  **Abort** — a multi-hour clip sweep or bootstrap no longer blocks the one job you
+  actually want. Stopping is cooperative (it lands at the next clip, lookup or stage,
+  never mid-write) and loses nothing: every job resumes where it left off, so the card
+  says *stopped — run again to resume*. A start refused because something else holds
+  the slot is an honest **HTTP 409**, not a `200` with `started: false` buried in the
+  body. It also shows the running game
   (players, scores, round — never the current song, so a playing admin can't
   cheat) with **abandon game** and **change game master** controls, and picks the
   speaker the music plays on (**Speakers tab**, above). Set

@@ -287,9 +287,12 @@ function connect() {
     document.getElementById("b-live").hidden = s.phase === "idle";
     if (s.phase === "idle") return;
     const st = document.getElementById("b-status");
-    if (s.phase === "lobby") st.textContent = `Lobby — ${s.players.length} in` + (s.host ? `  ·  🎤 ${s.host}` : "");
-    if (s.phase === "question") st.textContent = `Round ${s.round}/${s.total_rounds} — listen! 🎧`;
-    if (s.phase === "reveal") st.textContent = `Round ${s.round}/${s.total_rounds}`;
+    if (s.phase === "lobby") st.textContent = `Lobby — ${s.players.length} in` + (s.host ? `  ·  🎤 ${s.host}` : "") + (s.filter_label ? `  ·  🎯 ${s.filter_label}` : "");
+    // A themed game is worth announcing on the TV too — the room can see WHY every option
+    // is a 90s song, instead of reading it as a coincidence.
+    const theme = s.filter_label ? `  ·  🎯 ${s.filter_label}` : "";
+    if (s.phase === "question") st.textContent = `Round ${s.round}/${s.total_rounds} — listen! 🎧${theme}`;
+    if (s.phase === "reveal") st.textContent = `Round ${s.round}/${s.total_rounds}${theme}`;
     if (s.phase === "break") st.textContent = s.break_stage === "tf" && s.tf
       ? `🍿 Half time — true or false? ${s.tf.num}/${s.tf.total}` : "🍿 HALF TIME";
     if (s.phase === "finished") st.textContent = "🏆 Final!" + (s.next_host ? `  ·  🎤 ${s.next_host} masters the next game` : "");

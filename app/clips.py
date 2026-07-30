@@ -14,7 +14,7 @@ import tempfile
 import time
 from datetime import datetime, timezone
 
-from . import config, db, game, subsonic
+from . import config, db, game, jobs, subsonic
 
 CLIP_LENGTHS = (5, 10, 20)
 PAYOFF_LEN = 12
@@ -131,6 +131,11 @@ def cut_batch(conn, client: subsonic.Client, limit: int = 50,
         f"ORDER BY {TIER_ORDER}, global_listeners DESC LIMIT ?", (limit,)).fetchall()
     done = errors = 0
     for row in rows:
+        # Between tracks, never inside one: a half-written clip dir recorded as
+        # clipped_at would be an unplayable round forever after.
+        if jobs.cancelled():
+            LOGGER.warning("clip cut: aborted after %d of %d in this batch", done, len(rows))
+            break
         try:
             used_offset = cut_track(client, row, clips_dir)
         except ClipError as e:
@@ -157,6 +162,21 @@ def cut_batch(conn, client: subsonic.Client, limit: int = 50,
         f"AND (duration IS NULL OR duration BETWEEN {game.MIN_DURATION_S} AND {game.MAX_DURATION_S})"
     ).fetchone()["c"]
     return {"cut": done, "errors": errors, "remaining": remaining}
+
+
+def _abort_wait(seconds: float, tick: float = 0.5) -> bool:
+    """Sleep, but wake early if the job is aborted. True if it was.
+
+    Polls rather than waiting on the Event itself so tests can drive it with a
+    tiny stall_sleep_s and jobs.cancelled() stays the single source of truth.
+    """
+    waited = 0.0
+    while waited < seconds:
+        if jobs.cancelled():
+            return True
+        time.sleep(min(tick, seconds - waited))
+        waited += tick
+    return jobs.cancelled()
 
 
 def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
@@ -188,6 +208,9 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
     deadline = clock() + max_hours * 3600 if max_hours > 0 else None
     total = stalls = 0
     while True:
+        if jobs.cancelled():
+            LOGGER.warning("clip sweep: aborted — %d cut; resumes where it stopped", total)
+            return {"cut": total, "stopped": "aborted"}
         if deadline and clock() >= deadline:
             LOGGER.info("clip sweep: %.1fh time limit reached — %d cut; resumes next start", max_hours, total)
             return {"cut": total, "stopped": "time-limit"}
@@ -204,7 +227,11 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
             if stalls >= max_stalls:
                 LOGGER.error("clip sweep: no progress after %d attempts — giving up until next start", max_stalls)
                 return {"cut": total, "stopped": "stalled"}
-            time.sleep(stall_sleep_s)
+            # Interruptible: a plain sleep here would leave Abort looking broken
+            # for up to 10 minutes while the sweep waits out a backoff.
+            if _abort_wait(stall_sleep_s):
+                LOGGER.warning("clip sweep: aborted during backoff — %d cut", total)
+                return {"cut": total, "stopped": "aborted"}
             continue
         stalls = 0
         total += r["cut"]

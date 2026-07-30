@@ -54,6 +54,21 @@ CREATE TABLE IF NOT EXISTS results (
     fastest_ms INTEGER,
     PRIMARY KEY (game_id, player)
 );
+-- Which tracks have actually been ASKED, so later games don't repeat them.
+--
+-- `games`/`results` record who scored what but never which songs came up, so there was no
+-- history at all: every game picked from the whole pool and "we had this one last week" was
+-- inevitable and unfixable.
+--
+-- Deliberately NOT keyed on games.id. A row is written the moment a round STARTS, which is
+-- the only way an abandoned game counts — `abort` drops the game without ever calling
+-- finish(), so a games row may never exist for rounds that really were asked. Recency comes
+-- from played_at, and a track asked twice legitimately has two rows.
+CREATE TABLE IF NOT EXISTS plays (
+    track_id TEXT NOT NULL,
+    played_at TEXT NOT NULL       -- UTC ISO8601, when the clip started
+);
+CREATE INDEX IF NOT EXISTS idx_plays_played_at ON plays(played_at DESC);
 """
 
 

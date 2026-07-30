@@ -32,6 +32,7 @@ import os
 import time
 from collections import defaultdict
 
+from . import jobs
 from .library import _ARTICLE, artist_key
 
 LOGGER = logging.getLogger(__name__)
@@ -127,6 +128,11 @@ def scan(paths: list[str], cache: dict, set_stage=None) -> list[dict]:
     found, cached, started = [], 0, time.monotonic()
     total = len(paths)
     for i, path in enumerate(paths, 1):
+        if jobs.cancelled():
+            # Raise rather than return: a truncated `found` list would flow into
+            # plan() and look like a library that legitimately has no more files
+            # needing fixes — an abort must not be mistaken for a clean result.
+            raise jobs.JobAborted(f"aborted while scanning tags ({i} of {total})")
         try:
             st = os.stat(path)
         except OSError:
@@ -278,6 +284,14 @@ def _write(changes: list[dict], cache: dict | None = None, set_stage=None) -> in
     total = len(changes)
     with open(jp, "a") as journal:
         for i, c in enumerate(changes, 1):
+            # Unlike the scan, stopping here is a clean outcome rather than an
+            # error: the journal has flushed every file already written, so the
+            # count is true and a rerun resumes at this exact file.
+            if jobs.cancelled():
+                LOGGER.warning("retag: aborted after writing %d of %d file(s)", written, total)
+                if set_stage:
+                    set_stage(f"aborted — {written} of {total} written")
+                break
             entry = f"{c['path']}\t{c['target']}"
             if entry in done:
                 skipped += 1
