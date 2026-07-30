@@ -127,7 +127,7 @@ def test_sweep_runs_to_done_and_survives_stalls(monkeypatch):
         {"cut": 2, "errors": 0, "remaining": 0},    # done
     ]
 
-    def fake_batch(conn, client, limit=100):
+    def fake_batch(conn, client, limit=100, on_progress=None):
         r = results.pop(0)
         if isinstance(r, Exception):
             raise r
@@ -142,7 +142,7 @@ def test_sweep_runs_to_done_and_survives_stalls(monkeypatch):
 
 
 def test_sweep_gives_up_after_max_stalls(monkeypatch):
-    def always_fails(conn, client, limit=100):
+    def always_fails(conn, client, limit=100, on_progress=None):
         raise Exception("still down")
 
     monkeypatch.setattr(clips, "cut_batch", always_fails)
@@ -158,7 +158,7 @@ def test_sweep_stops_when_the_job_is_aborted(monkeypatch):
     from app import jobs
     calls = []
 
-    def fake_batch(conn, client, limit=100):
+    def fake_batch(conn, client, limit=100, on_progress=None):
         calls.append(1)
         if len(calls) == 2:
             jobs._CANCEL.set()      # aborted mid-run, as /api/admin/abort would
@@ -189,7 +189,7 @@ def test_sweep_wakes_early_from_a_stall_backoff_when_aborted(monkeypatch):
     """
     from app import jobs
     monkeypatch.setattr(clips, "cut_batch",
-                        lambda conn, client, limit=100: (_ for _ in ()).throw(Exception("down")))
+                        lambda conn, client, limit=100, on_progress=None: (_ for _ in ()).throw(Exception("down")))
     monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
     monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
     # Stands in for the operator hitting Abort a moment into the backoff. Also
@@ -242,7 +242,7 @@ def test_sweep_respects_time_limit(monkeypatch):
     """CLIP_SWEEP_MAX_HOURS: stops cleanly at the deadline, resumes next start."""
     ticker = iter(range(0, 100000, 1800))  # each clock() call advances 30 min
 
-    def fake_batch(conn, client, limit=100):
+    def fake_batch(conn, client, limit=100, on_progress=None):
         return {"cut": 100, "errors": 0, "remaining": 5000}  # never finishes
 
     monkeypatch.setattr(clips, "cut_batch", fake_batch)

@@ -236,16 +236,86 @@ def test_log_capture_attach_and_detach():
     assert len(jobs.JOBS["chatty"]["log"]) == n
 
 
-def test_log_capped():
+def test_a_long_log_keeps_the_LAST_lines_not_the_first():
+    """The sink used to keep the FIRST 100 lines and then stop, so the admin page's
+    "tail" was the head. On a multi-hour clip sweep the newest line shown was hours
+    old the moment the log filled — read as "the job has stalled", and a healthy
+    sweep was aborted on that evidence three times, losing ~11 hours of cutting.
+
+    Lines are numbered so first and last are distinguishable: a length-only check
+    would pass just as happily with the old first-N sink in place.
+    """
     def noisy(set_stage):
-        for i in range(300):
+        for i in range(200):
             logging.getLogger("app.n").info("line %d", i)
         return {}
     jobs.register("noisy", "Noisy", noisy)
     jobs.start("noisy")
     wait_done("noisy")
-    assert len(jobs.JOBS["noisy"]["log"]) == jobs.LOG_LINES_MAX + 1
-    assert jobs.JOBS["noisy"]["log"][-1] == "… (output capped)"
+    log = jobs.JOBS["noisy"]["log"]
+    assert len(log) == jobs.LOG_LINES_MAX
+    # whole-line numbers, not substrings: "line 1" also matches "line 100"
+    kept = {int(line.rsplit(" ", 1)[1]) for line in log}
+    assert kept == set(range(100, 200)), sorted(kept)[:5]
+
+
+def test_a_truncated_log_says_so_when_the_api_serves_it():
+    """Bounded FIFO means old lines vanish silently. Without a marker a reader
+    can't tell a truncated log from a short one — and the whole point of this
+    change is that the log stops implying things it doesn't know."""
+    def noisy(set_stage):
+        for i in range(150):
+            logging.getLogger("app.n").info("line %d", i)
+        return {}
+    jobs.register("noisy", "Noisy", noisy)
+    jobs.start("noisy")
+    wait_done("noisy")
+    served = jobs.status()["jobs"]["noisy"]["log"]
+    assert "dropped" in served[0] and "50" in served[0], served[0]
+    # leading, not trailing: a note after the last line reads as "it stopped here"
+    assert "line 199" not in served[0]
+    assert "line 149" in served[-1]
+
+
+def test_a_short_log_is_served_clean_with_no_truncation_marker():
+    """The marker must not appear on every run, or it stops meaning anything."""
+    jobs.register("quiet", "Quiet",
+                  lambda set_stage: logging.getLogger("app.n").info("just the one") or {})
+    jobs.start("quiet")
+    wait_done("quiet")
+    served = jobs.status()["jobs"]["quiet"]["log"]
+    assert not any("dropped" in line for line in served), served
+
+
+def test_the_served_log_is_a_json_array_not_a_deque():
+    """`log` is a deque on the job record and /admin renders it with .join().
+    Handing FastAPI's encoder the deque itself worked by luck; a plain list at
+    the boundary is the contract, and TestClient proves the JSON shape."""
+    import threading
+    from fastapi.testclient import TestClient
+    from app import main
+    gate = threading.Event()
+
+    def chatty(set_stage):
+        logging.getLogger("app.n").info("hello from the running job")
+        gate.wait(3)
+        return {}
+
+    jobs.register("clips", "Clip cutting", chatty)
+    c = TestClient(main.app)
+    jobs.start("clips")
+    try:
+        # polled MID-RUN, as /admin does every couple of seconds
+        while not jobs.JOBS["clips"]["log"]:
+            time.sleep(0.01)
+        body = c.get("/api/admin/status").json()
+        log = body["jobs"]["clips"]["log"]
+        assert isinstance(log, list)
+        assert any("hello from the running job" in line for line in log)
+        assert "log_dropped" in body["jobs"]["clips"]   # discoverable, not hidden
+    finally:
+        gate.set()
+        wait_done("clips")
 
 
 def test_check_token(monkeypatch):
