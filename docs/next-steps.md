@@ -234,26 +234,57 @@ Keep `make test-js` green; it renders every phase for exactly this reason.
 
 ## 9. Discover Chromecasts from /admin and pick one in flight
 
-**Cost:** 2–3 days, and **one infrastructure question decides whether it works at all.**
+**Cost:** 2–3 days. **The networking approach is decided — see below.**
 
 Today `DISPLAYS` is parsed from the environment **at import time** as hardcoded `Name=ip`
 pairs ([board_cast.py:12-19](../app/board_cast.py#L12-L19)) — there is no discovery. Worth
 knowing: **`DISPLAYS` is not set in production**, so casting is currently unconfigured
 altogether. This item is what would make it usable without hand-collecting IPs.
 
-The good news: the pinned `pychromecast` 14.0.10 does expose discovery —
-`get_chromecasts()`, `discover_chromecasts()`, `start_discovery()`. So the library can do
-it.
+The pinned `pychromecast` 14.0.10 does expose discovery — `get_chromecasts()`,
+`discover_chromecasts()`, `start_discovery()` — so the library can do it.
 
-**The blocker to check first:** discovery is mDNS/zeroconf multicast, and
-`docker-compose.yml` uses **default bridge networking with a published port**. Multicast
-does not cross a bridge network, so `get_chromecasts()` inside the container will most
-likely find **nothing**, while the existing `get_chromecast_from_host()` path keeps working
-because it connects to a known IP directly. Establish this before building any UI —
-probe from inside the running container. If it can't see anything, the options are
-`network_mode: host` (which changes port publishing and interacts with SELinux on this
-host), a `known_hosts` list (helpful, but that's back to typing IPs), or discovery on the
-host with the result passed in. That choice is the whole shape of the feature.
+### The networking constraint, and the decided approach
+
+Discovery is mDNS/zeroconf multicast, and `docker-compose.yml` uses **default bridge
+networking with a published port** ([docker-compose.yml:12](../docker-compose.yml#L12)).
+Multicast does not cross a bridge network, so `get_chromecasts()` from inside the container
+finds **nothing**. The existing `get_chromecast_from_host()` path is unaffected, because it
+dials a known IP directly.
+
+**Decision (owner, 2026-07-30): give the container its own real LAN IP** — a macvlan (or
+ipvlan) network — **as an opt-in extra in `docker-compose.yml`, only needed if you want
+scanning.** The LAN in question is known to carry mDNS. Default deployment stays on bridge
+with today's published port, so nothing changes for anyone who doesn't want discovery.
+
+Why a real IP rather than `network_mode: host`: host mode puts the app straight onto the
+host's port 8000, and **8000 is already taken on this host** — that's the collision
+`QUIZ_PORT` exists to dodge (see the port trap in the working rules below). A macvlan
+address gives the container its own port 8000 with nothing to collide with, and keeps
+multicast intact.
+
+**Consequences to handle, not discover later:**
+
+- **The app's address changes** on the macvlan path — it's the container's LAN IP, not
+  `host:QUIZ_PORT`. `BOARD_URL`, `JOIN_URL` and `APP_BASE_URL` are all absolute and would
+  need to match, as would whatever reverse proxy fronts it (`APP_BASE_URL` is currently an
+  HTTPS name, so the proxy target moves). Get this wrong and the board still loads while
+  the join QR points somewhere unreachable.
+- **Macvlan needs a parent interface named in the compose file**, which is host-specific —
+  exactly the kind of deployment detail that must come from `.env`, never a committed
+  literal. See the working rules below.
+- **The host usually cannot reach its own macvlan container** without an extra route. Bear
+  it in mind when a health check from the host itself starts failing for no apparent
+  reason.
+- **Make it genuinely optional.** Compose can't toggle a network block with a plain
+  variable, so this likely wants a documented override file (e.g. an opt-in
+  `docker-compose.macvlan.yml` used with `-f`) rather than edits to the committed default.
+- Keep `known_hosts` / manual `DISPLAYS` working regardless, as the fallback for anyone on
+  bridge — discovery should *add* to that path, not replace it.
+
+Probe before building UI: bring the container up on the macvlan and confirm
+`get_chromecasts()` actually returns devices. Everything above assumes it does; the LAN
+carries mDNS, but this is the one step worth proving rather than assuming.
 
 Also note the existing "pick in flight" pattern to copy rather than reinvent: the `hub`
 already holds a mutable `display` and the `set_display` websocket handler already swaps
