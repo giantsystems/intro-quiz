@@ -131,3 +131,17 @@ correct — the CI badge reflects upstream's build, not this fork's.
 > **Note:** GitHub Actions is not enabled on this fork, so no CI has run on any of its
 > pull requests. `make test` and the two node smokes only ever run locally. Worth
 > enabling if this fork gets more contributors than one.
+
+### No Dependabot either
+
+Upstream's `.github/dependabot.yml` is removed here. With Actions off, the weekly
+`github-actions` bumps patched `publish.yml` — a workflow that never runs — and the branches
+just accumulated: six of them, none with an open PR, each stranded on the commit it was cut
+from. By the time they were noticed they were 22 commits behind `master`, so merging any one
+would have reverted `tests/test_ws.py` wholesale and dropped `mutagen` (which `app/retag.py`
+imports) from `requirements.txt`. A bump that old is quicker to redo by hand than to rebase.
+
+Dependency updates are therefore manual: bump the pin in `requirements.txt` on a current
+branch and run `make test` plus `make test-js`. Re-enable Dependabot alongside Actions if
+this fork ever gets CI, not before — the value is in a bot that can prove its own bumps
+green, and without CI it can't.
