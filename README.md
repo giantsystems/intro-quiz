@@ -171,6 +171,15 @@ subscriptions.
   away, so a themed round widens its decoy search rather than breaking the illusion.
   The filter narrows *this game only* — `/health` and the artist wall still measure the
   whole library. The theme shows on the board and on every phone.
+- **Leaving a genre out** — the mirror of a theme: pick genres to *exclude* and the rest of
+  the library still plays. Not the same as ticking every other box, and that's the point —
+  the picker only lists genres above the `min_tracks` floor, so a few hundred quizzable
+  tracks carry a tag no checkbox ever shows, and ticking round a genre quietly loses them.
+  Excluding by name keeps them, **untagged tracks included**: the rule is "leave out only
+  what I named", so a track with no genre tag was never named and stays eligible. Excluded
+  genres are kept out of the **decoys** too — a wrong answer is read out loud like any other
+  option — and the exclusion is stated on the board and every phone ("no Blues"), because an
+  exclusion-only game otherwise looks exactly like an unfiltered one.
 - **The TV board** — a second web page cast to the display via DashCast
   (pychromecast). The board **plays the round audio itself** through the Web Audio API
   (one audio context for the whole game) — casting clips as media would evict the
