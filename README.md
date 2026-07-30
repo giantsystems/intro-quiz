@@ -14,7 +14,8 @@
 > a skippable payoff song, a no-dependencies local dev setup, and a few
 > deployment-specific compose changes. What diverges and what to watch out for when
 > merging upstream: **[docs/fork-changes.md](docs/fork-changes.md)**. The badges above
-> track upstream's build, not this fork's.
+> track upstream's build, not this fork's. Picking the work back up:
+> **[docs/next-steps.md](docs/next-steps.md)**.
 
 Self-hosted "guess the intro" music quiz for family game night, built on your own
 [Navidrome](https://www.navidrome.org/) library. A song's **first 5 seconds** play
