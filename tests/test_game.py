@@ -348,16 +348,17 @@ def test_bootstrap_job_sequence(monkeypatch):
     monkeypatch.setattr(main.db, "connect", lambda *a, **k: DummyConn())
     monkeypatch.setattr(main.subsonic, "Client", lambda: object())
     monkeypatch.setattr(main.sync, "sync_library",
-                        lambda c, cl: calls.append("sync") or {"tracks_active": 42})
+                        lambda c, cl, set_stage=None: calls.append("sync") or {"tracks_active": 42})
     monkeypatch.setattr(main.lastfm, "score_batch",
                         lambda c, limit: calls.append("lastfm") or next(lastfm_runs))
     monkeypatch.setattr(main.scoring, "assign_tiers",
                         lambda c: calls.append("tiers") or {"easy": 1})
     monkeypatch.setattr(main.clips, "sweep",
-                        lambda: calls.append("clips") or {"cut": 7, "stopped": "done"})
+                        lambda set_stage=None: calls.append("clips") or {"cut": 7, "stopped": "done"})
     monkeypatch.setattr(main.library, "clean",
                         lambda c: calls.append("hygiene") or {"banned": {"duplicate": 3}})
-    out = main._job_bootstrap(lambda stage: None)
+    # the registry's real callback signature, ticks included (jobs._run_wrapped)
+    out = main._job_bootstrap(lambda stage, log=True: None)
     # hygiene must land BEFORE clips: each row it bans is a clip not cut, and
     # cutting is the expensive step. Cleaning afterwards pays for the junk first.
     assert calls == ["sync", "lastfm", "lastfm", "tiers", "hygiene", "clips"]
