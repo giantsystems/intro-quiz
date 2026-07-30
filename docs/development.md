@@ -39,6 +39,39 @@ the HTML fails silently in a browser. Both are cheap and worth keeping green.
 Timing is tested, not slept: `Game` takes an injectable `clock` (`app/game.py`), so
 speed-bonus and deadline behaviour is asserted at whatever "time" the test likes.
 
+## The websocket protocol
+
+`app/main.py` registers one handler per message kind in a `HANDLERS` table:
+
+    @handler("answer", requires_game=True)
+    async def on_answer(s: WSSession, msg: dict) -> None:
+        s.hub.game.answer(s.who(msg), int(msg["choice"]))
+        ...
+
+`s` is a `WSSession` — the socket plus the player name it claimed at `join`. The name
+has to live on an object rather than as a local in `ws_endpoint` because handlers both
+read and *write* it, and a table of functions can't rebind a caller's local.
+
+Two flags carry rules the old chain buried in its ordering:
+
+- `requires_game=True` — the handler dereferences `hub.game`. Without a game the
+  sender gets `no game — start one first`. Previously an `AttributeError` on `None`
+  escaped the socket loop and killed the connection, so the phone got no error *and*
+  no state: it simply went dead.
+- `counts_as_activity=False` — liveness and plumbing traffic (`ping`, `board_hello`,
+  `set_display`) that must not touch `hub.last_activity`, or a phone parked on the page
+  keeps a finished game from ever expiring.
+
+Handlers take `(session, msg)` and nothing else, so `tests/test_ws.py` calls them
+through the real `dispatch()` against a throwaway `Hub` and a `FakeWS` that records
+what was sent. That file is where the *authority* rules live — only the master starts
+rounds, a crowned-but-absent master loses the wheel, only a **present** master can
+abandon a game (#46), the board can turn its own board off but a non-master player
+can't (#31). None of it had a test while it was reachable only through a live socket.
+
+An unknown message kind is ignored, not an error: phones cache their JS across
+deploys, so a retired type outliving its handler is normal traffic.
+
 ## Testing the integrations
 
 The seeded DB covers the game itself. For the parts that talk to something real, fill

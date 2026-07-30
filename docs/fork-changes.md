@@ -75,6 +75,19 @@ job. It's the only part of the app that writes to the music library, so it's off
 Home Assistant and no Docker** — a seeded database of fake tracks with silent generated
 clips. See [development.md](development.md).
 
+### The websocket handler table
+
+`ws_endpoint` was a ~260-line `if/elif` over 15 message kinds, all of it reachable only
+through a live socket, and consequently untested. It's now a `HANDLERS` dict of
+`(session, msg)` coroutines with `tests/test_ws.py` calling them directly —
+see [development.md](development.md#the-websocket-protocol).
+
+Behaviour changed in one place, deliberately: a handler that needs a game and doesn't
+have one now returns a `GameError` the phone can display. Before, it raised
+`AttributeError` on `None` out of the socket loop and dropped the connection. **On a
+merge, keep the table** — the branch order in upstream's chain encodes nothing the flags
+don't say more clearly, and reverting loses every authority test with it.
+
 ---
 
 ## Deployment adaptations

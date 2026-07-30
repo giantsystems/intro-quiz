@@ -148,7 +148,12 @@ subscriptions.
   is recognised rather than fed to ffmpeg.
 - **The game engine** — one websocket hub (FastAPI), phases lobby → question → reveal.
   Rounds are built lazily at first start so artist picks land first. Answer timing is
-  server-side; the correct answer never ships to clients before the reveal.
+  server-side; the correct answer never ships to clients before the reveal. Every
+  message kind (`join`, `answer`, `next`, …) is a registered handler rather than a
+  branch of one long chain, so the rules about *who may do what* — only the master
+  starts rounds, only a **present** master can abandon a game — are unit-tested
+  instead of only reachable through a live socket. A message arriving between games
+  now gets a readable error rather than dropping the connection.
 - **No repeats between games** — every round that actually gets asked is stamped in a
   `plays` table, and the picker prefers songs it hasn't played in the last ~200 rounds
   (about 20 games). It's a *preference*, not a filter: on a pool too small to avoid
