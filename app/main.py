@@ -146,6 +146,11 @@ def api_stats():
             "with_family_score": conn.execute("SELECT COUNT(*) c FROM tracks WHERE play_count>0").fetchone()["c"],
             "with_global_score": conn.execute("SELECT COUNT(*) c FROM tracks WHERE global_listeners IS NOT NULL").fetchone()["c"],
             "tiered": conn.execute("SELECT tier, COUNT(*) c FROM tracks WHERE tier IS NOT NULL GROUP BY tier").fetchall(),
+            # how much of the library has actually been ASKED — the freshness history
+            # (see the `plays` table) gives this for free
+            "rounds_played": conn.execute("SELECT COUNT(*) c FROM plays").fetchone()["c"],
+            "distinct_tracks_played": conn.execute(
+                "SELECT COUNT(DISTINCT track_id) c FROM plays").fetchone()["c"],
         }
     finally:
         conn.close()
@@ -489,13 +494,15 @@ class Hub:
         return not self.board_expected() and not (self.game and self.game.everyone_remote())
 
     async def start_round(self):
-        if not self.game.rounds:
-            conn = db.connect()
-            try:
+        conn = db.connect()
+        try:
+            if not self.game.rounds:
                 self.game.build_rounds(conn)
-            finally:
-                conn.close()
-        rnd = self.game.start_round()
+            # conn passed so the round is recorded in `plays` — the cross-game history
+            # that keeps later games off songs we've just had
+            rnd = self.game.start_round(conn)
+        finally:
+            conn.close()
         if self.play_in_room():  # board plays its own audio; all-remote needs no room audio
             asyncio.get_event_loop().run_in_executor(None, ha.play_clip, rnd["track"]["id"], str(rnd["clip_len"]))
         self.cancel_deadline()
@@ -1335,7 +1342,12 @@ def api_ban_album(pattern: str):
 @app.post("/api/leaderboard/reset", dependencies=ADMIN)
 def api_leaderboard_reset(confirm: str = ""):
     """Wipe the all-time leaderboard (games + results). Deliberately API-only —
-    no button in the family UI. Requires ?confirm=yes."""
+    no button in the family UI. Requires ?confirm=yes.
+
+    The `plays` history is deliberately NOT wiped: it isn't score data, and clearing it
+    would make the next few games repeat songs we've just had. Resetting the scoreboard
+    is about scores.
+    """
     if confirm != "yes":
         return Response(status_code=400,
                         content="add ?confirm=yes to wipe the all-time leaderboard")

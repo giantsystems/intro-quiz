@@ -767,6 +767,112 @@ def test_a_null_duration_track_is_still_quizzable():
         conn.close(); os.unlink(p)
 
 
+# -- cross-game track history ----------------------------------------------
+
+def _played(conn, track_id, at):
+    conn.execute("INSERT INTO plays(track_id, played_at) VALUES(?,?)", (track_id, at))
+    conn.commit()
+
+
+def test_a_started_round_is_recorded_even_if_the_game_is_abandoned():
+    """Why the stamp is in start_round and not finish(): `abort` throws the game away
+    without ever calling finish, and an abandoned game's questions were still asked out
+    loud. Recording at start is the only point that knows a round really happened."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=3, tiers=["easy", "medium"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        first = g.start_round(conn)["track"]["id"]
+        g.reveal()
+        second = g.start_round(conn)["track"]["id"]
+        # ...and now the game is abandoned: no finish(), no games row
+        rows = [r["track_id"] for r in conn.execute("SELECT track_id FROM plays")]
+        assert rows == [first, second], "both asked rounds recorded, round 3 never asked"
+        assert conn.execute("SELECT COUNT(*) c FROM games").fetchone()["c"] == 0
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_start_round_without_a_conn_records_nothing_and_does_not_crash():
+    """The engine stays usable with no DB handle — 18 existing tests call start_round()
+    bare, and a missing history row must never be the thing that breaks a round."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=2, tiers=["easy", "medium"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        g.start_round()
+        assert conn.execute("SELECT COUNT(*) c FROM plays").fetchone()["c"] == 0
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_picker_prefers_tracks_that_have_not_been_played_lately():
+    conn, p = make_db(0)
+    try:
+        for i in range(6):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+        # t0..t3 all played; t4/t5 never
+        for i in range(4):
+            _played(conn, f"t{i}", f"2026-07-0{i + 1}T00:00:00")
+        for _ in range(30):
+            picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+            assert set(picked) == {"t4", "t5"}, f"fresh tracks must win outright: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_pool_smaller_than_the_history_still_fills_the_round():
+    """The reason recency SORTS instead of filtering. A hard exclude of everything played
+    looks equivalent on a 14,000-track library and fails outright on a small pool — which
+    a genre+decade filter can easily produce. Worst case we hand back the LEAST recently
+    asked repeats, which is what a human would do."""
+    conn, p = make_db(0)
+    try:
+        for i in range(3):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+            _played(conn, f"t{i}", f"2026-07-0{i + 1}T00:00:00")   # t2 = most recent
+        picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+        assert len(picked) == 2, "the round still fills — no GameError"
+        assert set(picked) == {"t0", "t1"}, f"the two stalest, not the freshest: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_recency_beats_nothing_when_a_track_was_played_twice():
+    """MAX(played_at) is what counts: an old favourite played again last night is as
+    recent as anything else, not still stale from its first outing."""
+    conn, p = make_db(0)
+    try:
+        for i in range(3):
+            _insert(conn, f"t{i}", f"Song {i}", f"Band {i}")
+        _played(conn, "t0", "2026-01-01T00:00:00")   # long ago...
+        _played(conn, "t0", "2026-07-29T00:00:00")   # ...but again last night
+        _played(conn, "t1", "2026-02-01T00:00:00")
+        for _ in range(30):
+            assert [t["id"] for t in game.pick_tracks(conn, 1, ["easy"])] == ["t2"]
+        picked = [t["id"] for t in game.pick_tracks(conn, 2, ["easy"])]
+        assert set(picked) == {"t2", "t1"}, f"t0 is the freshest play, so it goes last: {picked}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_boost_round_avoids_repeating_the_same_favourite_artist_track():
+    """This matters more than the main pool: a player picks the same three favourite
+    artists most weeks, so without a freshness preference their boost round is drawn from
+    a handful of tracks and lands on the same song every time."""
+    conn, p = make_db(0)
+    try:
+        _insert(conn, "old", "Highway To Hell", "AC/DC")
+        _insert(conn, "new", "Back In Black", "AC/DC")
+        _played(conn, "old", "2026-07-29T00:00:00")
+        for _ in range(30):
+            assert game.pick_artist_track(conn, ["AC/DC"], set())["id"] == "new"
+    finally:
+        conn.close(); os.unlink(p)
+
+
 def test_decoys_never_offer_two_spellings_of_the_same_band():
     """The other half of the variant problem: decoys are meant to be four
     DIFFERENT artists. 'Highway To Hell — AC/DC' plus 'Shoot To Thrill — AC, DC'

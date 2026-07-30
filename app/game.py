@@ -4,12 +4,15 @@ One game at a time (it's a kitchen, not a casino). The websocket layer in
 main.py drives this and broadcasts snapshots; timing uses an injectable
 clock so tests don't sleep.
 """
+import logging
 import os
 import random
 import time
 from datetime import datetime, timezone
 
 from . import library, trivia
+
+LOGGER = logging.getLogger(__name__)
 
 ANSWER_WINDOW_S = 20
 PAYOFF_S = 12          # mirrors clips.PAYOFF_LEN — how long the reveal payoff runs
@@ -33,6 +36,10 @@ QUIZZABLE = ("active=1 AND banned=0 AND clipped_at IS NOT NULL "
              f"AND (duration IS NULL OR duration BETWEEN {MIN_DURATION_S} AND {MAX_DURATION_S})")
 BASE_POINTS = 100
 SPEED_BONUS_MAX = 50  # linear decay to 0 across the window
+# How many recently-asked tracks the picker tries to avoid. Roughly 20 games of 10 rounds:
+# far enough back that a weekly quiz never repeats itself, small enough that the pool still
+# feels like the whole library. It is a preference, not a filter — see _freshest().
+RECENT_MEMORY = 200
 # Remote players stream the clip to their own phone, so their audio starts a
 # beat after the room's — buffering, then decode. Their speed bonus is measured
 # from when their audio actually started instead of from the room clock, but the
@@ -45,16 +52,46 @@ class GameError(RuntimeError):
     pass
 
 
+def recent_track_ids(conn, limit: int = RECENT_MEMORY) -> list[str]:
+    """The most recently ASKED track ids, newest first — see the `plays` table.
+
+    Returned as an ordered list rather than a set because "how recently" is what makes
+    the fallback graceful: when a pool is too small to avoid repeats entirely, the
+    freshest repeats are the ones to give back first.
+    """
+    return [r["track_id"] for r in conn.execute(
+        "SELECT track_id, MAX(played_at) m FROM plays GROUP BY track_id "
+        "ORDER BY m DESC LIMIT ?", (limit,))]
+
+
+def _freshest(rows: list, recent: list[str], n: int) -> list:
+    """Take n rows, preferring ones not played lately.
+
+    Recency SORTS rather than filters, on purpose. A hard exclude looks equivalent on a
+    14,000-track pool and breaks badly on a small one: a genre+decade filter can cut the
+    pool to a few dozen, where excluding the last 200 plays would leave too few tracks and
+    fail the game outright at start. Sorting can always fill the round — worst case it
+    hands back the least-recently-asked repeats, which is exactly what a human would do.
+    """
+    rank = {tid: i for i, tid in enumerate(recent)}   # 0 = most recent
+    fresh_rank = len(recent)                          # never played beats every repeat
+    # rows arrive already shuffled (ORDER BY RANDOM()), so equal-recency rows stay random
+    return sorted(rows, key=lambda r: -rank.get(r["id"], fresh_rank))[:n]
+
+
 def pick_tracks(conn, rounds: int, tiers: list[str], exclude: set | None = None) -> list[dict]:
     qmarks = ",".join("?" * len(tiers))
     ex = exclude or set()
     exq = f"AND id NOT IN ({','.join('?' * len(ex))}) " if ex else ""
+    # Deliberately NOT "LIMIT rounds": the freshness sort needs candidates to choose
+    # BETWEEN. Limiting in SQL would hand back 10 random rows and leave nothing to prefer,
+    # so the whole history would have no effect. Capped so a huge library stays cheap.
     rows = conn.execute(
         f"SELECT * FROM tracks WHERE {QUIZZABLE} AND tier IN ({qmarks}) {exq}"
-        f"ORDER BY RANDOM() LIMIT ?", (*tiers, *ex, rounds)).fetchall()
+        f"ORDER BY RANDOM() LIMIT ?", (*tiers, *ex, max(rounds * 20, 200))).fetchall()
     if len(rows) < rounds:
         raise GameError(f"only {len(rows)} clipped tracks in tiers {tiers} — need {rounds}")
-    return [dict(r) for r in rows]
+    return [dict(r) for r in _freshest(rows, recent_track_ids(conn), rounds)]
 
 
 def pick_artist_track(conn, artists: list[str], exclude: set) -> dict | None:
@@ -73,10 +110,13 @@ def pick_artist_track(conn, artists: list[str], exclude: set) -> dict | None:
     exq = f"AND id NOT IN ({','.join('?' * len(ex))}) " if ex else ""
     rows = conn.execute(
         f"SELECT * FROM tracks WHERE {QUIZZABLE} {exq}ORDER BY RANDOM()", tuple(ex)).fetchall()
-    for r in rows:
-        if library.artist_key(r["artist"]) in wanted:
-            return dict(r)
-    return None
+    matches = [r for r in rows if library.artist_key(r["artist"]) in wanted]
+    if not matches:
+        return None
+    # Same freshness preference as the main pool. It matters MORE here: a player picks the
+    # same three favourite artists most weeks, so without this their boost round is drawn
+    # from a handful of tracks and lands on the same song repeatedly.
+    return dict(_freshest(matches, recent_track_ids(conn), 1)[0])
 
 
 def pick_decoys(conn, track: dict, n: int = 3) -> list[dict]:
@@ -216,7 +256,7 @@ class Game:
         return bool(self.players) and all(p.get("remote") for p in self.players.values())
 
     # -- rounds --------------------------------------------------------------
-    def start_round(self) -> dict:
+    def start_round(self, conn=None) -> dict:
         if self.phase not in ("lobby", "reveal", "break"):
             raise GameError(f"cannot start a round from {self.phase}")
         if not self.players:
@@ -228,7 +268,27 @@ class Game:
         rnd["started_at"] = self.clock()
         rnd["deadline_at"] = rnd["started_at"] + ANSWER_WINDOW_S
         self.phase = "question"
+        # Stamp the play HERE, not in finish(): `abort` throws the game away without ever
+        # calling finish (main.py, the 'abort' branch), and an abandoned game's questions
+        # were still asked out loud. Recording at start is also the only point that knows
+        # a round really happened — self.rounds is built for the whole game up front.
+        # conn is optional so the engine stays usable without a DB in tests.
+        if conn is not None:
+            self.note_played(conn, rnd["track"]["id"])
         return rnd
+
+    def note_played(self, conn, track_id: str) -> None:
+        """Remember that a track was asked, for the freshness preference in pick_tracks.
+
+        Never fatal: a failed write here would abort a round that is already playing over
+        the speaker, and the cost of losing the row is one possible repeat weeks later.
+        """
+        try:
+            conn.execute("INSERT INTO plays(track_id, played_at) VALUES(?,?)",
+                         (track_id, datetime.now(timezone.utc).isoformat()))
+            conn.commit()
+        except Exception:  # noqa: BLE001 — a history row is never worth killing a round for
+            LOGGER.warning("could not record play of %s", track_id, exc_info=True)
 
     def extend_clip(self) -> int:
         """Bump the current round to the next clip length (5 -> 10 -> 20).
