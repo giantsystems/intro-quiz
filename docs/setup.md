@@ -276,7 +276,7 @@ To enable it, mount the library read-write and name the roots as seen inside the
 
 ```ini
 # .env
-MUSIC_HOST_DIR=/path/to/library                 # host path, mounted at /music-src
+MUSIC_HOST_DIR=/path/to/library         # host path, mounted at /music-src
 MUSIC_DIRS="/music-src/music:/music-src/itunes/iTunes Music"
 ```
 
