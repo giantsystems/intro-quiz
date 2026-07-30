@@ -68,9 +68,22 @@ function render() {
     const btn = document.getElementById(`run-${name}`);
     const wrap = document.getElementById(`logwrap-${name}`);
     const card = document.getElementById(`card-${name}`);
-    btn.disabled = !!current;               // one job at a time, server-enforced
-    btn.textContent = current === name ? "Running…" : "Run";
-    card.classList[current === name ? "add" : "remove"]("busy");
+    // The running job's own button becomes its Abort control. It was a disabled
+    // "Running…" — dead UI on the one card you might actually want to act on,
+    // and a bootstrap that has hours left blocks every other action meanwhile.
+    const isCurrent = current === name;
+    btn.disabled = !!current && !isCurrent;
+    if (isCurrent) {
+      btn.textContent = j && j.abort_requested ? "Stopping…" : "Abort";
+      btn.classList.add("danger");
+      btn.disabled = !!(j && j.abort_requested);
+      btn.onclick = abortJob;
+    } else {
+      btn.textContent = "Run";
+      btn.classList.remove("danger");
+      btn.onclick = () => runAction(name);
+    }
+    card.classList[isCurrent ? "add" : "remove"]("busy");
     if (!j) {
       st.className = "status";
       st.textContent = "no runs since restart";
@@ -83,6 +96,12 @@ function render() {
     } else if (j.error) {
       st.className = "status fail";
       st.textContent = `failed · ${ago(j.finished_at)} — ${j.error}`;
+    } else if (j.aborted) {
+      // Not "ok": a stopped job leaves the work half done, and every job is
+      // resumable, so the useful thing to say is "run it again".
+      st.className = "status warn";
+      st.textContent = `stopped · ${ago(j.finished_at)} — ${summaryLine(j.summary) ||
+        "aborted"} · run again to resume`;
     } else {
       st.className = "status ok";
       const warn = j.summary && j.summary.warning ? ` — ⚠ ${j.summary.warning}` : "";
@@ -272,6 +291,17 @@ async function testSpeaker() {
     const d = await r.json();
     if (!r.ok) { err(d.detail || `test failed (${r.status})`); return; }
     err(d.played ? `fanfare sent to ${d.target}` : "nothing played — casting is disabled or unconfigured");
+  } catch (e) { err(e.message); }
+}
+
+async function abortJob() {
+  // No confirm(): every job is resumable — re-running continues where it stopped —
+  // so the cost of a mis-tap is one wasted batch, not lost work.
+  try {
+    const r = await call("/api/admin/abort", { method: "POST" });
+    if (!r.ok) { err((await r.json()).detail || `abort failed (${r.status})`); return; }
+    err("stopping at the next safe point — a clip in flight finishes first");
+    await refresh();
   } catch (e) { err(e.message); }
 }
 

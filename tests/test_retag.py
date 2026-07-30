@@ -242,6 +242,67 @@ def test_write_fixes_the_tag_and_leaves_the_path_alone(monkeypatch, tmp_path):
     assert mutagen.File(str(root / "a.mp3"), easy=True)["artist"] == ["AC/DC"]
 
 
+def test_scan_raises_rather_than_returning_a_truncated_file_list():
+    """An aborted scan must NOT return what it found so far.
+
+    plan() over a truncated list looks exactly like a library that legitimately
+    has no more fixes to make, so the job would report "0 changes" and a caller
+    could reasonably conclude the tags were clean. Needs no ffmpeg: the cancel
+    check is the first thing in the loop, before any file is opened.
+    """
+    from app import jobs
+    jobs._CANCEL.set()
+    try:
+        with pytest.raises(jobs.JobAborted):
+            retag.scan(["/nope/a.mp3", "/nope/b.mp3"], {})
+    finally:
+        jobs._CANCEL.clear()
+
+
+@pytest.mark.skipif(not HAVE_FFMPEG, reason="needs ffmpeg to generate test MP3s")
+def test_an_aborted_write_keeps_its_journal_so_a_rerun_resumes(monkeypatch, tmp_path):
+    """Stopping the WRITE loop is a clean, resumable outcome — the opposite of the
+    scan. Every file written is journalled and flushed, so the count is true and a
+    rerun continues at the file it stopped on."""
+    from app import jobs
+    root = tmp_path / "lib"; root.mkdir()
+    # The majority spelling IS the target, so the well-tagged files have to
+    # outnumber the broken ones or plan() decides 'AC, DC' is correct and there is
+    # nothing to write at all.
+    for n in "abcde":
+        make_mp3(str(root / f"{n}.mp3"), "AC/DC", f"Song {n}")
+    for n in "wxyz":
+        make_mp3(str(root / f"{n}.mp3"), "AC, DC", f"Song {n}")
+    monkeypatch.setattr(retag, "MUSIC_DIRS", [str(root)])
+    monkeypatch.setattr(retag, "STATE_DIR", str(tmp_path))
+
+    # Hooked on _recache rather than _open_audio: the SCAN opens files too, so
+    # counting opens would trip the cancel during the scan phase and raise instead
+    # of exercising the write loop. _recache runs only on a successful write.
+    real_recache = retag._recache
+    written = []
+
+    def counting_recache(cache, path, artist, album_artist):
+        written.append(path)
+        if len(written) == 2:
+            jobs._CANCEL.set()      # abort after the second file is written
+        return real_recache(cache, path, artist, album_artist)
+
+    monkeypatch.setattr(retag, "_recache", counting_recache)
+    try:
+        out = retag.run(write=True)
+        assert out["written"] == 2, "should have stopped part-way, not written all four"
+        jobs._CANCEL.clear()
+        # the rest happen on the next run, and the first two are not redone
+        again = retag.run(write=True)
+        assert again["written"] == 2
+    finally:
+        jobs._CANCEL.clear()
+    import mutagen
+    for n in "abcdewxyz":
+        assert mutagen.File(str(root / f"{n}.mp3"), easy=True)["artist"] == ["AC/DC"]
+
+
 @pytest.mark.skipif(not HAVE_FFMPEG, reason="needs ffmpeg to generate test MP3s")
 def test_write_is_journalled_so_a_rerun_resumes(monkeypatch, tmp_path):
     root = tmp_path / "lib"; root.mkdir()

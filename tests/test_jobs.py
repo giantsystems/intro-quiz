@@ -13,10 +13,12 @@ def clean_registry():
     jobs.ACTIONS.clear()
     jobs.JOBS.clear()
     jobs._CURRENT[0] = None
+    jobs._CANCEL.clear()   # a leaked flag would abort the next test's job instantly
     yield
     jobs.ACTIONS.clear()
     jobs.JOBS.clear()
     jobs._CURRENT[0] = None
+    jobs._CANCEL.clear()   # a leaked flag would abort the next test's job instantly
 
 
 def wait_done(name, timeout=5.0):
@@ -69,6 +71,147 @@ def test_global_one_at_a_time():
     started, _ = jobs.start("other")
     assert started
     wait_done("other")
+
+
+def test_abort_asks_the_running_job_to_stop_and_it_reports_aborted():
+    """The job cooperates by returning early — the common case, since most jobs
+    have partial progress worth reporting."""
+    import threading
+    seen, released = [], threading.Event()
+
+    def loops(set_stage):
+        for i in range(1000):
+            if jobs.cancelled():
+                return {"did": i}          # partial summary, not an exception
+            seen.append(i)
+            released.set()
+            time.sleep(0.01)
+        return {"did": "all"}
+
+    jobs.register("loops", "Loops", loops)
+    jobs.start("loops")
+    released.wait(2)
+    asked, name = jobs.abort()
+    assert (asked, name) == (True, "loops")
+    assert jobs.JOBS["loops"]["abort_requested"] is True
+    wait_done("loops")
+    j = jobs.JOBS["loops"]
+    # returning early must NOT be mistaken for success — that's the whole point
+    assert j["stage"] == "aborted"
+    assert j["aborted"] is True
+    assert j["error"] is None            # stopped on purpose isn't a failure
+    assert j["summary"]["did"] < 1000     # it really stopped short
+
+
+def test_a_job_that_raises_jobaborted_is_stopped_not_failed():
+    def raiser(set_stage):
+        raise jobs.JobAborted("aborted while scanning")
+    jobs.register("raiser", "Raiser", raiser)
+    jobs.start("raiser")
+    wait_done("raiser")
+    j = jobs.JOBS["raiser"]
+    assert j["stage"] == "aborted" and j["aborted"] is True
+    # must not land in the red "failed" bucket, or /admin cries wolf
+    assert j["error"] is None
+
+
+def test_abort_with_nothing_running_is_refused():
+    assert jobs.abort() == (False, None)
+
+
+def test_the_cancel_flag_does_not_leak_into_the_next_job():
+    """Regression guard: clearing on completion instead of on start would let an
+    aborted job's flag kill the very next one before it did any work.
+
+    The flag is set directly rather than by aborting a real job — the previous
+    run's thread can still be unwinding when the next start() lands, and racing
+    to reproduce that would make this test flaky about the thing it's asserting.
+    """
+    import threading
+    ran = threading.Event()
+    jobs.register("second", "Second", lambda set_stage: (ran.set(), {"n": 1})[1])
+    jobs._CANCEL.set()                     # the state an aborted run leaves behind
+    assert jobs.cancelled() is True
+    started, _ = jobs.start("second")
+    assert started
+    wait_done("second")
+    assert ran.is_set()
+    assert jobs.JOBS["second"]["stage"] == "done"    # NOT "aborted"
+    assert jobs.JOBS["second"]["aborted"] is False
+
+
+def test_a_refused_start_is_409_not_a_cheerful_200():
+    """/api/bootstrap and /api/library/retag used to answer HTTP 200 with
+    started:false in the body, so `curl -f` in a cron and every casual glance said
+    the job had been queued when nothing had. /api/admin/run always got this right."""
+    import threading
+    from fastapi.testclient import TestClient
+    from app import main
+    gate = threading.Event()
+    # replace the real registrations — no network, no library, no ffmpeg
+    jobs.register("bootstrap", "Full pipeline", lambda set_stage: (gate.wait(3), {})[1])
+    jobs.register("retag", "Artist tags: preview", lambda set_stage: {})
+    jobs.register("clips", "Clip cutting", lambda set_stage: {})
+    c = TestClient(main.app)
+    try:
+        assert c.post("/api/bootstrap").status_code == 200      # first one starts
+        for path in ("/api/bootstrap", "/api/admin/run/clips"):
+            r = c.post(path)
+            assert r.status_code == 409, f"{path} answered {r.status_code}"
+            assert "bootstrap" in r.json()["detail"]
+    finally:
+        gate.set()
+        wait_done("bootstrap")
+
+
+def test_the_abort_endpoint_is_409_when_there_is_nothing_to_stop():
+    """So a script can tell "stopped it" from "there was nothing running"."""
+    import threading
+    from fastapi.testclient import TestClient
+    from app import main
+    gate = threading.Event()
+    jobs.register("clips", "Clip cutting", lambda set_stage: (gate.wait(3), {})[1])
+    c = TestClient(main.app)
+    r = c.post("/api/admin/abort")
+    assert r.status_code == 409 and "no job" in r.json()["detail"]
+    jobs.start("clips")
+    try:
+        r = c.post("/api/admin/abort")
+        assert r.status_code == 200 and r.json() == {"aborting": "clips"}
+    finally:
+        gate.set()
+        wait_done("clips")
+
+
+def test_bootstrap_stops_its_stage_chain_instead_of_grinding_on(monkeypatch, tmp_path):
+    """The inner loops stop themselves, but without the between-stage guards an
+    abort during sync would still be followed by lastfm, tiers, hygiene and hours
+    of clip cutting — the exact complaint that made abort necessary."""
+    from app import db as adb, main
+    # Capture the real connect FIRST: main.db is the same module object as adb, so
+    # patching it and then calling adb.connect would recurse into the patch.
+    real_connect = adb.connect
+    monkeypatch.setattr(main.db, "connect", lambda *a, **k: real_connect(str(tmp_path / "b.db")))
+    stages = []
+
+    def fake_sync(conn, client):
+        stages.append("sync")
+        jobs._CANCEL.set()          # abort lands during the very first stage
+        return {"tracks_active": 3}
+
+    monkeypatch.setattr(main.sync, "sync_library", fake_sync)
+    monkeypatch.setattr(main.subsonic, "Client", lambda: object())
+    monkeypatch.setattr(main.lastfm, "score_batch",
+                        lambda *a, **k: stages.append("lastfm") or {"scored": 0, "remaining": 1})
+    monkeypatch.setattr(main.scoring, "assign_tiers", lambda conn: stages.append("tiers") or {})
+    monkeypatch.setattr(main.library, "clean", lambda conn: stages.append("hygiene") or {"banned": {}})
+    monkeypatch.setattr(main.clips, "sweep", lambda *a, **k: stages.append("clips") or {})
+    jobs.register("bootstrap", "Full pipeline", main._job_bootstrap)
+    jobs.start("bootstrap")
+    wait_done("bootstrap")
+    assert stages == ["sync"], f"kept going after the abort: {stages}"
+    assert jobs.JOBS["bootstrap"]["stage"] == "aborted"
+    assert jobs.JOBS["bootstrap"]["error"] is None
 
 
 def test_unknown_action_raises():

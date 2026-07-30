@@ -152,6 +152,92 @@ def test_sweep_gives_up_after_max_stalls(monkeypatch):
     assert out == {"cut": 0, "stopped": "stalled"}
 
 
+def test_sweep_stops_when_the_job_is_aborted(monkeypatch):
+    """Abort is what makes a multi-hour sweep interruptible. It must stop between
+    batches and report what it got, since the sweep resumes where it left off."""
+    from app import jobs
+    calls = []
+
+    def fake_batch(conn, client, limit=100):
+        calls.append(1)
+        if len(calls) == 2:
+            jobs._CANCEL.set()      # aborted mid-run, as /api/admin/abort would
+        # 'remaining' never reaches 0, so only the abort can end this sweep. The
+        # bail-out keeps a broken abort a FAILURE rather than a hung test run.
+        assert len(calls) < 50, "sweep ignored the abort and kept batching"
+        return {"cut": 5, "errors": 0, "remaining": 9999}
+
+    monkeypatch.setattr(clips, "cut_batch", fake_batch)
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    try:
+        out = clips.sweep(stall_sleep_s=0)
+    finally:
+        jobs._CANCEL.clear()
+    assert out == {"cut": 10, "stopped": "aborted"}
+    assert len(calls) == 2      # stopped at the boundary, didn't grind on
+
+
+def test_sweep_wakes_early_from_a_stall_backoff_when_aborted(monkeypatch):
+    """The backoff is 10 minutes in production. Sleeping through it would leave
+    Abort looking broken for exactly as long as the server was already stuck.
+
+    The abort has to land WHILE the sweep is waiting: setting the flag up front
+    means the top-of-loop check returns first and _abort_wait is never reached, so
+    the test would pass with a plain time.sleep in there. That's the version of
+    this test that failed to catch a deliberately reverted fix.
+    """
+    from app import jobs
+    monkeypatch.setattr(clips, "cut_batch",
+                        lambda conn, client, limit=100: (_ for _ in ()).throw(Exception("down")))
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    # Stands in for the operator hitting Abort a moment into the backoff. Also
+    # bounds the test: a non-interruptible wait would sleep 6 × 300s for real.
+    slept = []
+
+    def fake_sleep(s):
+        slept.append(s)
+        jobs._CANCEL.set()
+
+    monkeypatch.setattr(clips.time, "sleep", fake_sleep)
+    try:
+        out = clips.sweep(stall_sleep_s=300, max_stalls=6)
+    finally:
+        jobs._CANCEL.clear()
+    assert out["stopped"] == "aborted"
+    # One 0.5s tick, not a 300s block: the wait polls and bails out. A plain
+    # time.sleep(stall_sleep_s) shows up here as a single 300.
+    assert slept and max(slept) <= 1, f"slept in one long block: {slept}"
+
+
+def test_cut_batch_stops_between_tracks_not_mid_track(monkeypatch, tmp_path):
+    """Granularity matters: a clip dir half-written but marked clipped_at would be
+    an unplayable round forever. So the check sits between tracks.
+
+    cut_track is faked, so this needs no ffmpeg — it's the loop under test.
+    """
+    from app import jobs
+    conn, _ = make_db([{"id": "t1"}, {"id": "t2"}, {"id": "t3"}])
+    cut = []
+
+    def fake_cut(client, row, clips_dir):
+        cut.append(row["id"])
+        jobs._CANCEL.set()      # abort lands while the FIRST track is in flight
+        return 0
+
+    monkeypatch.setattr(clips, "cut_track", fake_cut)
+    try:
+        r = clips.cut_batch(conn, object(), limit=10, clips_dir=str(tmp_path))
+    finally:
+        jobs._CANCEL.clear()
+    assert len(cut) == 1                      # the in-flight track finished
+    assert r["cut"] == 1
+    # and it was recorded as done — an interrupted batch must not lose the work
+    assert conn.execute("SELECT COUNT(*) c FROM tracks WHERE clipped_at IS NOT NULL"
+                        ).fetchone()["c"] == 1
+
+
 def test_sweep_respects_time_limit(monkeypatch):
     """CLIP_SWEEP_MAX_HOURS: stops cleanly at the deadline, resumes next start."""
     ticker = iter(range(0, 100000, 1800))  # each clock() call advances 30 min

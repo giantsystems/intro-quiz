@@ -11,7 +11,15 @@ const elems = {};
 let failures = 0;
 function mkEl(id) {
   return { id, hidden: false, disabled: false, textContent: "", innerHTML: "", value: "",
-           className: "", style: {}, classList: { add(){}, remove(){} },
+           className: "", style: {},
+           // A real set, not no-ops: add()/remove() that do nothing make every
+           // assertion about a styled state (the red Abort button, the busy
+           // card outline) pass no matter what the code does.
+           classList: (() => {
+             const s = new Set();
+             return { add: (c) => s.add(c), remove: (c) => s.delete(c),
+                      contains: (c) => s.has(c) };
+           })(),
            addEventListener(){}, appendChild(){},
            // Parses the inputs back out of whatever innerHTML the render wrote, so
            // groupPicks() reads the real checked state instead of a hand-fed list —
@@ -90,14 +98,42 @@ for (const snap of ${JSON.stringify(snapshots)}) {
   adminState = snap;
   try { render(); } catch (e) { console.log("RENDER THREW:", e.message); failures++; }
 }
-// running job: its button says Running…, every button disabled, stage shown
+// running job: its OWN button becomes Abort and stays live, others disabled
 adminState = ${JSON.stringify(snapshots[1])}; render();
-if (document.getElementById("run-clips").textContent !== "Running…") {
-  console.log("running button label wrong"); failures++; }
+if (document.getElementById("run-clips").textContent !== "Abort") {
+  console.log("running button should offer Abort, got:",
+              document.getElementById("run-clips").textContent); failures++; }
+if (document.getElementById("run-clips").disabled) {
+  console.log("Abort must be clickable on the running job"); failures++; }
 if (!document.getElementById("run-sync").disabled) {
   console.log("other buttons live during a run"); failures++; }
 if (!/61 remaining/.test(document.getElementById("status-clips").textContent)) {
   console.log("stage missing:", document.getElementById("status-clips").textContent); failures++; }
+if (!document.getElementById("run-clips").classList.contains("danger")) {
+  console.log("Abort should be styled as the destructive action"); failures++; }
+
+// abort already asked for: the button latches so a second tap can't re-fire it
+adminState = { current: "clips", jobs: { clips: job({ running: true, abort_requested: true,
+                stage: "cutting — 61 remaining", finished_at: null }) }, game: { phase: "idle" } };
+render();
+if (document.getElementById("run-clips").textContent !== "Stopping…") {
+  console.log("abort not acknowledged in the UI, got:",
+              document.getElementById("run-clips").textContent); failures++; }
+if (!document.getElementById("run-clips").disabled) {
+  console.log("a requested abort must not stay clickable"); failures++; }
+
+// a finished-but-aborted job: amber "stopped", not green ok, and Run is back
+adminState = { current: null, jobs: { clips: job({ stage: "aborted", aborted: true,
+                summary: { cut: 40, stopped: "aborted" } }) }, game: { phase: "idle" } };
+render();
+const abSt = document.getElementById("status-clips");
+if (!/stopped/.test(abSt.textContent) || !/run again/.test(abSt.textContent)) {
+  console.log("aborted job should read as stopped+resumable, got:", abSt.textContent); failures++; }
+if (abSt.className !== "status warn") {
+  console.log("aborted job must not render as ok/fail, got:", abSt.className); failures++; }
+if (document.getElementById("run-clips").textContent !== "Run" ||
+    document.getElementById("run-clips").disabled) {
+  console.log("Run must return once the job has stopped"); failures++; }
 // the spoiler line + revealed song
 if (!/hidden until reveal/.test(document.getElementById("game-detail").textContent)) {
   console.log("spoiler note missing"); failures++; }

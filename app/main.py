@@ -370,17 +370,34 @@ def _job_hygiene(set_stage) -> dict:
 
 def _job_bootstrap(set_stage) -> dict:
     """The whole first-time pipeline, resumable: each step only processes
-    what's missing, so re-running after a failure continues where it stopped."""
+    what's missing, so re-running after a failure continues where it stopped.
+
+    Abort is checked BETWEEN stages as well as inside each one. The inner loops
+    stop themselves, but without these guards an abort during `sync` would be
+    followed by hours of lastfm and clips anyway — which is the exact complaint
+    that made abort necessary.
+    """
     out: dict = {}
+
+    def stage(name: str) -> None:
+        if jobs.cancelled():
+            raise jobs.JobAborted(f"aborted before {name}")
+        set_stage(name)
+
     conn = db.connect()
     try:
-        set_stage("sync")
+        stage("sync")
         r = sync.sync_library(conn, subsonic.Client())
         out["tracks_synced"] = r.get("tracks_active")
-        set_stage("lastfm")
+        stage("lastfm")
         for _ in range(2000):
             r = lastfm.score_batch(conn, limit=200)
             out["lastfm_remaining"] = r["remaining"]
+            if jobs.cancelled():
+                # score_batch already stopped itself; the partial scores it did
+                # commit are kept and the next run picks up the rest.
+                out["aborted_at"] = "lastfm"
+                return out
             set_stage(f"lastfm — {r['remaining']} remaining")
             if r["remaining"] == 0:
                 break
@@ -389,16 +406,16 @@ def _job_bootstrap(set_stage) -> dict:
                                   "LASTFM_API_KEY / network, then run bootstrap "
                                   "again to resume where it left off")
                 break
-        set_stage("tiers")
+        stage("tiers")
         out["tiers"] = scoring.assign_tiers(conn)
         # Before clips, never after: every row banned here is a clip not cut, and
         # clip cutting is the expensive step (one Navidrome download each, hours
         # for a big library). Cleaning afterwards would mean paying for junk first.
-        set_stage("hygiene")
+        stage("hygiene")
         out["hygiene"] = library.clean(conn)["banned"]
     finally:
         conn.close()
-    set_stage("clips")
+    stage("clips")
     r = clips.sweep()
     out.update({"clips_cut": r.get("cut"), "clips_stopped": r.get("stopped")})
     return out
@@ -423,7 +440,12 @@ async def api_bootstrap():
     """
     started, st = jobs.start("bootstrap")
     if not started:
-        return {"started": False, "already_running": True, "status": st}
+        # 409, not 200. A refused start used to come back as a cheerful HTTP 200
+        # with started:false buried in the body, so `curl -f` in a cron and every
+        # "did it work?" glance said yes while nothing had been queued.
+        raise HTTPException(status_code=409,
+                            detail=f"busy with {st.get('busy_with')} — "
+                                   f"POST /api/admin/abort to stop it")
     return {"started": True, "watch": "/health"}
 
 
@@ -1042,6 +1064,19 @@ def api_admin_run(name: str):
     return {"started": True, "job": name}
 
 
+@app.post("/api/admin/abort", dependencies=ADMIN)
+def api_admin_abort():
+    """Ask the running maintenance job to stop at its next safe boundary.
+
+    409 when nothing is running, so a script can tell "stopped it" from "there
+    was nothing to stop" — same reasoning as run's 409 on a busy server.
+    """
+    asked, name = jobs.abort()
+    if not asked:
+        raise HTTPException(status_code=409, detail="no job is running")
+    return {"aborting": name}
+
+
 @app.post("/api/admin/game/abandon", dependencies=ADMIN)
 async def api_admin_game_abandon():
     """Abandon the running game from /admin. The admin overrides the ws
@@ -1384,7 +1419,9 @@ def api_library_retag(write: bool = False):
                         content=json.dumps({"error": "MUSIC_DIRS is not set — see docs/setup.md"}))
     started, st = jobs.start("retag_write" if write else "retag")
     if not started:
-        return {"started": False, "already_running": True, "status": st}
+        raise HTTPException(status_code=409,
+                            detail=f"busy with {st.get('busy_with')} — "
+                                   f"POST /api/admin/abort to stop it")
     return {"started": True, "write": write, "watch": "/admin"}
 
 

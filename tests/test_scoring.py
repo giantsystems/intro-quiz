@@ -94,6 +94,35 @@ def test_family_plays_still_beat_the_listener_floor():
         os.unlink(p)
 
 
+def test_lastfm_batch_stops_mid_batch_when_aborted(monkeypatch):
+    """Checked per LOOKUP, not per batch: a bootstrap does ~14,000 of these at 4/s,
+    so waiting for a batch boundary would be a ~50s delay on every abort. The scores
+    already committed are kept — the next run only fetches what's still NULL."""
+    from app import jobs
+    monkeypatch.setattr(lastfm, "API_KEY", "test-key")
+    seen = []
+
+    def handler(request):
+        seen.append(request.url.params["track"])
+        if len(seen) == 2:
+            jobs._CANCEL.set()      # abort lands after the second lookup
+        return httpx.Response(200, json={"track": {"listeners": "10", "playcount": "20"}})
+
+    conn, p = make_db([{"id": f"t{i}", "title": f"S{i}"} for i in range(8)])
+    try:
+        http = httpx.Client(transport=httpx.MockTransport(handler))
+        r = lastfm.score_batch(conn, http=http, delay_s=0)
+        assert len(seen) == 2, "kept fetching after the abort"
+        assert r["scored"] == 2
+        assert r["remaining"] == 6          # honest about what's left to do
+        # the two it did finish are committed, not rolled back
+        assert conn.execute("SELECT COUNT(*) c FROM tracks WHERE global_listeners IS NOT NULL"
+                            ).fetchone()["c"] == 2
+    finally:
+        jobs._CANCEL.clear()
+        os.unlink(p)
+
+
 def test_lastfm_batch_caches_zero_for_unknown(monkeypatch):
     monkeypatch.setattr(lastfm, "API_KEY", "test-key")
     def handler(request):

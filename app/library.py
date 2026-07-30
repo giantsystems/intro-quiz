@@ -40,6 +40,8 @@ import re
 import unicodedata
 from collections import defaultdict
 
+from . import jobs
+
 LOGGER = logging.getLogger(__name__)
 
 # A clip needs a 20s intro plus a 12s payoff from a LATER part of the song. Below
@@ -193,6 +195,12 @@ def clean(conn, reasons: list[str] | None = None, dry_run: bool = False) -> dict
     for reason in picked:
         if reason not in FINDERS:
             raise ValueError(f"unknown clean-up: {reason} (have {sorted(FINDERS)})")
+        # Between finders. Each is one pass over the table (seconds), and the
+        # docstring's ordering argument means stopping mid-list leaves a
+        # deliberately PARTIAL clean-up — so raise rather than return a summary
+        # that reads as a completed audit.
+        if jobs.cancelled():
+            raise jobs.JobAborted(f"aborted before the {reason} clean-up")
         rows = FINDERS[reason](conn)
         out["banned"][reason] = len(rows)
         out["examples"][reason] = [
