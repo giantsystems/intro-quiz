@@ -853,8 +853,13 @@ async def on_join(s: WSSession, msg: dict) -> None:
     # socket, so its next message isn't silently attributed to nobody.
     s.name = msg.get("name", "")
     s.hub.game.join(s.name, remote=bool(msg.get("remote")))
+    # Re-claimed in the spelling the game actually stored. Every host check is an
+    # equality test against g.host, so a phone that joined as `robin` while the
+    # lobby already held `Robin` would be handed Robin's slot and then refused
+    # control of Robin's own rounds.
+    s.name = s.hub.game.resolve_name(s.name)
     if s.hub.game.host is None and s.ws is s.hub.host_ws:
-        s.hub.game.host = s.name.strip()[:24]
+        s.hub.game.host = s.name
     await s.hub.broadcast()
 
 

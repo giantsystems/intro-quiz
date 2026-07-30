@@ -1091,3 +1091,191 @@ def test_decoys_never_offer_two_spellings_of_the_same_band():
             assert len(acdc) <= 1, decoys
     finally:
         conn.close(); os.unlink(p)
+
+
+# -- one player, one row: names folded by case ------------------------------
+#
+# `results.player` is plain TEXT and `join` only ever did `.strip()[:24]`, so
+# `robin` and `Robin` were two all-time rows and a returning player lost their
+# whole history by typing a lowercase name. Fixed while the production
+# leaderboard was still empty, so there was nothing to merge by hand.
+
+def _result(conn, game_id, player, score, correct=1, fastest_ms=1000):
+    conn.execute("INSERT OR IGNORE INTO games(id, started_at, rounds) VALUES(?,?,10)",
+                 (game_id, f"2026-07-{game_id:02d}T20:00:00"))
+    conn.execute("INSERT INTO results(game_id, player, score, correct, fastest_ms) "
+                 "VALUES(?,?,?,?,?)", (game_id, player, score, correct, fastest_ms))
+    conn.commit()
+
+
+def test_mixed_case_spellings_of_one_player_are_one_leaderboard_row():
+    """The bug in full: three games under three capitalisations read as three
+    different people, each with a third of the history. Totals must add up over
+    the person, not the spelling — and fastest_ms is the MINIMUM across all of
+    them, not whichever row grouped first."""
+    conn, p = make_db(0)
+    try:
+        _result(conn, 1, "robin", 100, correct=2, fastest_ms=1800)
+        _result(conn, 2, "Robin", 200, correct=3, fastest_ms=900)
+        _result(conn, 3, "ROBIN", 50, correct=1, fastest_ms=2500)
+        _result(conn, 1, "Bob", 10, correct=1, fastest_ms=4000)
+        lb = game.all_time_leaderboard(conn)
+        assert [r["player"] for r in lb] == ["Robin", "Bob"], \
+            f"one person must be one row: {lb}"
+        me = lb[0]
+        assert me["games"] == 3
+        assert me["total_score"] == 350
+        assert me["total_correct"] == 6
+        assert me["fastest_ms"] == 900, "the best time of all three, not an arbitrary row's"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_leaderboard_name_does_not_depend_on_which_row_sqlite_picked():
+    """GROUP BY ... COLLATE NOCASE hands back an ARBITRARY member spelling for the
+    SELECTed column, so without display_name() the name on the board would depend
+    on insertion order. Same person, two histories inserted in opposite orders —
+    the displayed name has to come out identical."""
+    conn, p = make_db(0)
+    try:
+        _result(conn, 1, "rObIn", 100)
+        _result(conn, 2, "ROBIN", 100)
+        first = game.all_time_leaderboard(conn)[0]["player"]
+    finally:
+        conn.close(); os.unlink(p)
+    conn, p = make_db(0)
+    try:
+        _result(conn, 1, "ROBIN", 100)
+        _result(conn, 2, "rObIn", 100)
+        second = game.all_time_leaderboard(conn)[0]["player"]
+    finally:
+        conn.close(); os.unlink(p)
+    assert first == second == "Robin", f"unstable display name: {first!r} vs {second!r}"
+
+
+def test_display_name_is_title_case_with_its_known_flattening():
+    """Deliberately simple, and this pins the accepted cost so a future refinement
+    is a decision rather than an accident: `JB` flattens to `Jb`. If that is ever
+    fixed, this assertion is the one to change — and only in display_name."""
+    assert game.display_name("robin") == "Robin"
+    assert game.display_name("ROBIN") == "Robin"
+    assert game.display_name("  robin  ") == "Robin"
+    assert game.display_name("mary jane") == "Mary Jane"
+    assert game.display_name("JB") == "Jb"
+    assert game.display_name("x" * 40) == "X" + "x" * 23, "the 24-char cap still applies"
+
+
+def test_joining_as_a_case_variant_takes_the_same_seat_and_keeps_the_score():
+    """The lobby half of the fold. Someone whose phone autocapitalised — or who
+    just typed lowercase after a reconnect — must land back in their own seat.
+    Two seats would also put two spellings into `results` for one game, since the
+    primary key there is (game_id, player)."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=clock)
+        g.join("Robin")
+        g.build_rounds(conn)
+        rnd = g.start_round()
+        clock.t += 2
+        g.answer("Robin", rnd["correct"])
+        earned = g.players["Robin"]["score"]
+        assert earned > 0
+
+        g.join("robin")                       # same person, phone shouted quietly
+        assert list(g.players) == ["Robin"], f"a second seat opened: {list(g.players)}"
+        assert g.players["Robin"]["score"] == earned, "rejoining reset their score"
+        assert g.players["Robin"]["correct"] == 1
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_an_exact_name_rejoin_still_does_not_reset_a_player():
+    """The pre-existing behaviour the fold must not break: quiz.js re-sends `join`
+    on every reconnect, and `setdefault` is why that doesn't wipe a live player."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=clock)
+        g.join("Robin", remote=True)
+        g.build_rounds(conn)
+        rnd = g.start_round()
+        clock.t += 2
+        g.answer("Robin", rnd["correct"])
+        earned = g.players["Robin"]["score"]
+
+        g.join("Robin")                       # a plain reconnect
+        assert g.players["Robin"]["score"] == earned
+        assert g.players["Robin"]["remote"] is True, "a reconnect flipped them back to local"
+        assert list(g.players) == ["Robin"]
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_case_variant_join_is_seated_in_the_lobbys_spelling_not_the_typed_one():
+    """A fresh join is Title Cased, but an EXISTING player keeps the spelling the
+    lobby already holds. Renaming them mid-game would move the snapshot key out
+    from under every phone showing scores against it."""
+    conn, p = make_db()
+    try:
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=Clock())
+        g.join("mary jane")
+        assert list(g.players) == ["Mary Jane"], "a fresh join is Title Cased"
+        g.join("MARY JANE")
+        assert list(g.players) == ["Mary Jane"]
+        assert [pl["name"] for pl in g.snapshot()["players"]] == ["Mary Jane"]
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_case_variant_is_not_a_stranger_to_the_rest_of_the_game():
+    """Folding only in `join` would have been worse than the bug: the phone still
+    sends its typed name on `answer`, `ready` and the rest, and every one of those
+    checks membership — so a player seated as `Robin` would be told "join first"
+    for the whole game. A genuine stranger must still be refused."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=clock)
+        g.join("Robin", remote=True)
+        g.set_artists("robin", ["Artist 3"])
+        assert g.players["Robin"]["ready"] is True
+        assert g.players["Robin"]["artists"] == ["Artist 3"]
+        g.set_remote("ROBIN", True)
+        g.build_rounds(conn)
+        rnd = g.start_round()
+        clock.t += 1
+        g.note_audio_started("rObIn")
+        assert "Robin" in rnd["audio_started"], "the remote baseline landed on nobody"
+        g.answer("robin", rnd["correct"])
+        assert "Robin" in rnd["answers"]
+        assert g.all_answered()
+        with pytest.raises(game.GameError):   # not a spelling — a stranger
+            g.answer("Trevor", 0)
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_one_game_writes_one_results_row_per_person_however_they_spelled_it():
+    """`results` has PRIMARY KEY (game_id, player), so two spellings would both be
+    accepted inside a single game — splitting one night's score in two before the
+    leaderboard ever sees it."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=1, tiers=["easy", "medium"], clock=clock)
+        g.join("Robin")
+        g.join("robin")
+        g.build_rounds(conn)
+        rnd = g.start_round()
+        clock.t += 2
+        g.answer("ROBIN", rnd["correct"])
+        g.reveal()
+        gid = g.finish(conn)
+        rows = conn.execute("SELECT player, score FROM results WHERE game_id=?",
+                            (gid,)).fetchall()
+        assert [r["player"] for r in rows] == ["Robin"], f"one game, two rows: {list(rows)}"
+        assert rows[0]["score"] > 0
+        assert game.all_time_leaderboard(conn)[0]["games"] == 1
+    finally:
+        conn.close(); os.unlink(p)
