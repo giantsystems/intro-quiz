@@ -1,35 +1,38 @@
 # Next steps
 
-Where the work stands and what's worth doing next. Written 2026-07-30 at v1.33.0 — every
-claim below was checked against the code or the running server at that point, with file
-references so you can re-check rather than trust it.
+Where the work stands and what's worth doing next. Written 2026-07-30, current as of
+v1.34.0 — every claim below was checked against the code or the running server at that
+point, with file references so you can re-check rather than trust it.
 
 Two sections. **Items 1–5** are improvements found by reading the code, easiest first.
-**Items 6–11** were requested by the project's owner, listed in the order asked. The split
+**Items 6–13** were requested by the project's owner, listed in the order asked. The split
 matters: the second group is what someone actually wants, so prefer it when the two
 compete, even though several are dearer.
 
 Nothing here is committed to. Each item says what's actually wrong, why it's worth
 doing, and what it costs; if a better idea turns up, do that instead.
 
-**Cheap wins, if you want a short list:** items 1, 2 and 6 are half a day to a day each,
-and item 8 may be mostly layout. Items 4 and 11 have hard prerequisites, stated in place.
+**Cheap wins, if you want a short list:** item 13 is a couple of hours because the server
+already takes the parameter, and item 8 may be mostly layout. Items 4 and 11 have hard
+prerequisites, stated in place.
 
 ## Where things stand
 
-v1.33.0 is tagged, released, and running in production. It shipped five improvements:
-genre + decade round filters, a non-empty `easy` tier, cross-game track history,
+**v1.34.0** is running in production, deployed 2026-07-30. It shipped items 1, 2 and 6:
+honest job progress, case-folded player names, and genre exclusion. v1.33.0 before it
+brought genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
 - **Tests:** 259 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
-- **Library:** 23,083 tracks synced, 22,888 tiered
-  (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
-- **Clips:** ~18,000 of 22,888 cut, 26G, with 69G free on the clip disk. The sweep
-  resumes on each container start and **needs re-running after any deploy** that
-  restarts the container mid-sweep.
-- **Leaderboard:** empty. `rounds_played: 0` — no games have been played to completion
-  since the database was last dealt with. That emptiness is what made item 2 free to fix.
+- **Library:** 23,083 tracks synced, 22,888 tiered.
+- **Clips: the sweep is finished.** `clips_remaining: 0`, and `playable_by_tier` reads
+  `easy` 1,174 / `medium` 5,433 / `hard` 7,481 / `tiebreak` 7,776 — 21,864 of 22,888 tiered
+  tracks have a clip, the rest being rows the cutter can't use. Earlier notes here warned
+  the sweep needed re-running after every deploy; that no longer applies, and those fields
+  are how you'd tell rather than counting files over SSH.
+- **Leaderboard:** empty at the time item 2 landed (`rounds_played: 0`), which is what made
+  the case fold free to fix — no rows to migrate.
 
 Read [fork-changes.md](fork-changes.md) before touching anything that might conflict with
 upstream, and [development.md](development.md) to get a local environment without
@@ -174,8 +177,7 @@ mid-game restarts actually happen.
 
 Asked for on 2026-07-30, listed in the order they were requested rather than by cost.
 The cost estimates and the notes on what's already in place were checked against the code
-the same day. Items 6 and 8 are cheap and could go alongside items 1–2 above; item 11 is
-explicitly a maybe-never.
+the same day. Items 6, 8 and 13 are cheap; item 11 is explicitly a maybe-never.
 
 ## 6. Exclude genres from a game
 
@@ -355,6 +357,80 @@ or does only one game get audio? — not a refactor.
 **If it's ever wanted, do items 3 (route coverage) and 4 (split `main.py`) first.** Having
 the routes tested and the module split is the difference between a hard change and an
 unsafe one. Until then this is a note about why the code looks the way it does, not a plan.
+
+## 12. Bring the player-facing instructions up to date with the fork
+
+**Cost:** half a day, most of it deciding what to leave out.
+
+The **"How to play" card** on the join screen
+([index.html:17](../app/static/index.html#L17)) still described upstream's game. One line
+was actively wrong — *"Stuck? Ask for a few more seconds"* implies a player-facing control,
+but the replay is the game master's, and it fires only when nobody has answered
+([main.py:627](../app/main.py#L627)). Four fork features were missing: remote players
+hearing audio on their own phone, boost rounds, half-time trivia, and the all-time table.
+That card is now fixed; **the rest of this item is the same job everywhere else.**
+
+Worth checking, in rough order of how visible it is to a player:
+
+- **`v-master`** ([index.html:55](../app/static/index.html#L55)) lists what the master runs.
+  It reads well, but verify it against what the buttons now do — it predates the payoff-skip
+  change, where upstream's hard 12-second lock became a two-second grace.
+- **The `/board` screens** — idle, question, reveal, half time, finished. A TV in a room full
+  of people is read by everyone at once, and it's the one surface nobody can ask questions
+  about.
+- **`README.md`** — the feature list is a fork/upstream mix. [fork-changes.md](fork-changes.md)
+  is accurate and current; the README is what someone reads first.
+- **[setup.md](setup.md)** — accurate as far as it goes, but written incrementally per
+  feature. Remote players, speaker grouping, genre filters and exclusions each landed
+  separately, so a first-time reader gets the pieces in implementation order rather than
+  the order they'd set them up.
+
+**Why it's worth doing:** every one of these is a promise to a player. A wrong instruction
+costs more than a missing one — the player follows it, it doesn't work, and they conclude
+the app is broken rather than the text. The "ask for a few more seconds" line was that bug
+in miniature for however long it sat there.
+
+**Test it by** reading each screen as somebody who has never played, and by running
+`make test-js` — the two node smokes render every phase, so a broken tag fails there rather
+than on the night.
+
+## 13. Choose the number of rounds
+
+**Cost:** a couple of hours for the control, plus the decisions below.
+
+**The server already supports this.** `Game.__init__` takes `rounds`
+([game.py:305](../app/game.py#L305)) and the `new_game` handler already reads it
+([main.py:853](../app/main.py#L853)) — it's the phone that hardcodes the value:
+
+```js
+const msg = {type: "new_game", rounds: 10};   // quiz.js:531
+```
+
+So the work is a control on the idle card next to the theme and exclusion walls, and
+`total_rounds` is already in the snapshot and already rendered
+([quiz.js:612](../app/static/quiz.js#L612)), so the board and phone follow automatically.
+
+Three things need deciding, and they're the actual work:
+
+- **Half time only exists at 6+ rounds.** `is_halfway` is
+  `len(self.rounds) >= 6 and self.current + 1 == len(self.rounds) // 2`
+  ([game.py:661](../app/game.py#L661)), so a 4-round game silently has no trivia break.
+  That's defensible — but say so in the UI rather than letting it surprise the master.
+- **The pool preflight assumes 10.** There's an `enough_for_10` check that refuses a filter
+  selection too narrow to fill a game; a 5-round game could legitimately play a pool that
+  currently gets refused. Make the preflight use the chosen count, or a short game with a
+  tight theme will be blocked for no reason.
+- **Boost rounds are one per player** ([game.py:366](../app/game.py#L366)). Six players in a
+  4-round game means the boost rounds don't fit. Decide what gives — fewer boosts, or a
+  floor on the round count relative to the lobby size.
+
+**Why it's worth doing:** ten rounds is roughly 25 minutes with the reveals. A short game
+is the difference between "one more?" and "not tonight", and a long one suits a party that's
+settled in. The upstream constant is a guess about your evening.
+
+**Test it by** playing a 3-round and a 20-round game: assert `total_rounds` is honoured, that
+half time fires only where it should, and that a narrow filter which fills a short game is
+no longer refused.
 
 ---
 
