@@ -110,8 +110,11 @@ subscriptions.
   SQLite (tracks, artists, durations).
 - **Recognisability scoring** — two signals per track: *family* (Navidrome play
   counts + stars) and *global* (Last.fm listeners via `track.getInfo`). Blended into
-  difficulty tiers: your favourites are "easy"; world-famous songs you own but never
-  play are "medium" — the sweet spot where everyone has a chance.
+  difficulty tiers: your favourites are "easy", as are the handful of songs *everyone*
+  knows (1M+ Last.fm listeners); world-famous songs you own but never play are "medium"
+  — the sweet spot where everyone has a chance. The listener floor matters because the
+  family signal needs a hand-exported Navidrome dump: without one, "easy" would be
+  empty, and the default game asks for easy+medium.
 - **Library hygiene** — real libraries have three problems that all look like
   "duplicates", and they need opposite treatment. *Variant spellings* (`AC/DC`, `AC, DC`,
   `AC DC`) are **folded, never deleted**: one normalised artist key means the quiz sees one
