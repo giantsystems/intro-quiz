@@ -122,9 +122,26 @@ def cut_track(client: subsonic.Client, row, clips_dir: str | None = None) -> flo
     return offset
 
 
+def pending_count(conn) -> int:
+    """Tiered, playable-length tracks that still have no clips.
+
+    The same population cut_batch draws from, so "remaining" and "what the next
+    batch will pick up" can never drift apart.
+    """
+    return conn.execute(
+        f"SELECT COUNT(*) c FROM tracks WHERE active=1 AND banned=0 AND tier IS NOT NULL AND clipped_at IS NULL "
+        f"AND (duration IS NULL OR duration BETWEEN {game.MIN_DURATION_S} AND {game.MAX_DURATION_S})"
+    ).fetchone()["c"]
+
+
 def cut_batch(conn, client: subsonic.Client, limit: int = 50,
-              clips_dir: str | None = None) -> dict:
-    """Cut clips for tiered tracks that don't have them yet, easiest tiers first."""
+              clips_dir: str | None = None, on_progress=None) -> dict:
+    """Cut clips for tiered tracks that don't have them yet, easiest tiers first.
+
+    `on_progress(cut, errors)` fires after every track. A batch of 100 is up to an
+    hour of downloading, so reporting only per batch would leave the admin page
+    looking frozen for that hour — which is how a healthy sweep got read as wedged.
+    """
     rows = conn.execute(
         f"SELECT * FROM tracks WHERE active=1 AND banned=0 AND tier IS NOT NULL AND clipped_at IS NULL "
         f"AND (duration IS NULL OR duration BETWEEN {game.MIN_DURATION_S} AND {game.MAX_DURATION_S}) "
@@ -147,21 +164,18 @@ def cut_batch(conn, client: subsonic.Client, limit: int = 50,
             conn.execute("UPDATE tracks SET banned=1, ban_reason='decode' WHERE id=?", (row["id"],))
             conn.commit()
             shutil.rmtree(os.path.join(clips_dir or config.CLIPS_DIR, row["id"]), ignore_errors=True)
-            continue
         except Exception as e:  # noqa: BLE001 - transient (network etc.): retry next batch
             errors += 1
             LOGGER.warning("clip cut failed (will retry) for %s - %s: %s", row["artist"], row["title"], e)
             shutil.rmtree(os.path.join(clips_dir or config.CLIPS_DIR, row["id"]), ignore_errors=True)
-            continue
-        conn.execute("UPDATE tracks SET clipped_at=?, intro_offset=? WHERE id=?",
-                     (datetime.now(timezone.utc).isoformat(), used_offset, row["id"]))
-        conn.commit()
-        done += 1
-    remaining = conn.execute(
-        f"SELECT COUNT(*) c FROM tracks WHERE active=1 AND banned=0 AND tier IS NOT NULL AND clipped_at IS NULL "
-        f"AND (duration IS NULL OR duration BETWEEN {game.MIN_DURATION_S} AND {game.MAX_DURATION_S})"
-    ).fetchone()["c"]
-    return {"cut": done, "errors": errors, "remaining": remaining}
+        else:
+            conn.execute("UPDATE tracks SET clipped_at=?, intro_offset=? WHERE id=?",
+                         (datetime.now(timezone.utc).isoformat(), used_offset, row["id"]))
+            conn.commit()
+            done += 1
+        if on_progress:
+            on_progress(done, errors)
+    return {"cut": done, "errors": errors, "remaining": pending_count(conn)}
 
 
 def _abort_wait(seconds: float, tick: float = 0.5) -> bool:
@@ -180,7 +194,7 @@ def _abort_wait(seconds: float, tick: float = 0.5) -> bool:
 
 
 def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
-          max_hours: float = 0, clock=time.monotonic) -> dict:
+          max_hours: float = 0, clock=time.monotonic, set_stage=None) -> dict:
     """Run-once bulk cutter: batch until every tiered track has clips, then stop.
 
     This is the CLIP_SWEEP_ON_START bootstrap for fresh installs — one long
@@ -191,11 +205,22 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
     next start rather than hammering forever. max_hours > 0 caps the session
     (CLIP_SWEEP_MAX_HOURS): it finishes the batch in hand, stops cleanly, and
     resumes from where it left off on the next start.
+
+    `set_stage` — the job registry's callback, `set_stage(text, log=True)` — is
+    called per clip, per batch and on every stop reason. Without it the only
+    honest way to tell a running sweep from a wedged one was to count files on
+    disk twice a minute apart, and this sweep has been wrongly declared wedged
+    and killed on the strength of a `stage` that never moved off "starting".
     """
+    def stage(text: str, log: bool = True) -> None:
+        if set_stage:
+            set_stage(text, log=log)
+
     conn = db.connect()
     try:
         tiered = conn.execute(
             "SELECT COUNT(*) c FROM tracks WHERE active=1 AND tier IS NOT NULL").fetchone()["c"]
+        pending = pending_count(conn) if tiered else 0
     finally:
         conn.close()
     if tiered == 0:
@@ -207,6 +232,8 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
         return {"cut": 0, "stopped": "nothing-tiered"}
     deadline = clock() + max_hours * 3600 if max_hours > 0 else None
     total = stalls = 0
+    remaining = pending          # exact after every batch; the per-clip ticks estimate
+    stage(f"cutting — 0 cut this session, {remaining} to go")
     while True:
         if jobs.cancelled():
             LOGGER.warning("clip sweep: aborted — %d cut; resumes where it stopped", total)
@@ -214,9 +241,15 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
         if deadline and clock() >= deadline:
             LOGGER.info("clip sweep: %.1fh time limit reached — %d cut; resumes next start", max_hours, total)
             return {"cut": total, "stopped": "time-limit"}
+        # Bound as defaults, not read from the closure: both are rebound below and
+        # a tick has to describe the batch it belongs to.
+        def tick(cut, errors, done=total, left=remaining):
+            msg = f"cutting — {done + cut} cut this session, {max(0, left - cut)} to go"
+            stage(msg + (f", {errors} error(s)" if errors else ""), log=False)
+
         conn = db.connect()
         try:
-            r = cut_batch(conn, subsonic.Client(), limit=batch)
+            r = cut_batch(conn, subsonic.Client(), limit=batch, on_progress=tick)
         except Exception as e:  # noqa: BLE001 — server down/unconfigured: back off
             LOGGER.warning("clip sweep: batch failed (%s) — retrying in %ds", e, int(stall_sleep_s))
             r = None
@@ -227,6 +260,10 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
             if stalls >= max_stalls:
                 LOGGER.error("clip sweep: no progress after %d attempts — giving up until next start", max_stalls)
                 return {"cut": total, "stopped": "stalled"}
+            # "backing off" is the one stage that explains a sweep sitting still,
+            # which is the state that got misread as wedged.
+            stage(f"backing off {int(stall_sleep_s)}s after no progress "
+                  f"(attempt {stalls} of {max_stalls}) — {total} cut this session")
             # Interruptible: a plain sleep here would leave Abort looking broken
             # for up to 10 minutes while the sweep waits out a backoff.
             if _abort_wait(stall_sleep_s):
@@ -235,8 +272,10 @@ def sweep(batch: int = 100, stall_sleep_s: float = 600, max_stalls: int = 6,
             continue
         stalls = 0
         total += r["cut"]
+        remaining = r["remaining"]
         if r["cut"] or r["errors"]:
             LOGGER.info("clip sweep: +%d clips (%d errors), %d remaining", r["cut"], r["errors"], r["remaining"])
         if r["remaining"] == 0:
             LOGGER.info("clip sweep complete — %d cut this session", total)
             return {"cut": total, "stopped": "done"}
+        stage(f"cutting — {total} cut this session, {remaining} to go")

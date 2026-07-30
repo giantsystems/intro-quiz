@@ -5,6 +5,7 @@ sqlite DB (and clips for ffmpeg/CPU), and the full pipeline already chains
 most of them — parallel runs would just fight. Status is in-memory only;
 after a restart the page honestly says "no runs since restart".
 """
+import collections
 import logging
 import threading
 import time
@@ -72,27 +73,36 @@ def check_token(header_value: str) -> bool:
 
 class RunLogHandler(logging.Handler):
     """Captures the run's log lines for the admin page. Attached to the root
-    logger only while a job runs — safe because jobs never overlap."""
+    logger only while a job runs — safe because jobs never overlap.
 
-    def __init__(self, sink: list):
+    The sink is a bounded FIFO, so what survives is the TAIL. It used to keep the
+    first LOG_LINES_MAX lines and then stop, which made the admin page's "last
+    line" an hours-old line from the start of the run — a healthy multi-hour clip
+    sweep was declared wedged and aborted three times on that evidence.
+    """
+
+    def __init__(self, job: dict):
         super().__init__(level=logging.INFO)
-        self.sink = sink
+        self.job = job
+        self.sink = job["log"]
         self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s",
                                             datefmt="%H:%M:%S"))
 
     def emit(self, record):
-        if len(self.sink) < LOG_LINES_MAX:
-            try:
-                self.sink.append(self.format(record))
-            except Exception:  # noqa: BLE001 — logging must never break the job
-                pass
-        elif len(self.sink) == LOG_LINES_MAX:
-            self.sink.append("… (output capped)")
+        try:
+            if len(self.sink) == self.sink.maxlen:
+                # the deque is about to push the oldest line out — count it, so a
+                # reader can tell a truncated log from a short one (see status())
+                self.job["log_dropped"] += 1
+            self.sink.append(self.format(record))
+        except Exception:  # noqa: BLE001 — logging must never break the job
+            pass
 
 
 def _fresh_status() -> dict:
     return {"running": True, "stage": "starting", "started_at": time.time(),
-            "finished_at": None, "summary": None, "error": None, "log": [],
+            "finished_at": None, "summary": None, "error": None,
+            "log": collections.deque(maxlen=LOG_LINES_MAX), "log_dropped": 0,
             "abort_requested": False, "aborted": False}
 
 
@@ -117,11 +127,19 @@ def start(name: str) -> tuple[bool, dict]:
 def _run_wrapped(name: str) -> None:
     job = JOBS[name]
 
-    def set_stage(stage: str) -> None:
-        job["stage"] = stage
-        LOGGER.info("%s: %s", name, stage)
+    def set_stage(stage: str, log: bool = True) -> None:
+        """`log=False` for high-frequency progress ticks.
 
-    handler = RunLogHandler(job["log"])
+        The clip sweep ticks once per clip — thousands of them over a session. At
+        one log line each they would flush the 100-line tail (and `docker logs`)
+        of the warnings that actually matter, so a tick moves `stage` and stays
+        out of the log; the per-batch lines carry the story there.
+        """
+        job["stage"] = stage
+        if log:
+            LOGGER.info("%s: %s", name, stage)
+
+    handler = RunLogHandler(job)
     root = logging.getLogger()
     old_level = root.level
     if root.getEffectiveLevel() > logging.INFO:
@@ -151,10 +169,31 @@ def _run_wrapped(name: str) -> None:
             _CURRENT[0] = None
 
 
+def public_status(j: dict) -> dict:
+    """One job's record as the API serves it: `log` a plain JSON array, tail last.
+
+    The deque -> list conversion belongs here rather than in the record: the job
+    thread wants a bounded sink, the API wants a JSON array, and only the API
+    needs the "some lines were dropped" note spelled out for a human reader.
+    """
+    out = dict(j)
+    dropped = j.get("log_dropped", 0)
+    # deque.copy() rather than list(...): /admin polls this while the job is still
+    # logging, and iterating a deque another thread appends to raises RuntimeError.
+    lines = list(j["log"].copy())
+    if dropped:
+        # Leading, not trailing: the dropped lines are the OLD ones now, and a
+        # note at the end would read as "the job stopped talking here".
+        lines = [f"… ({dropped} earlier line(s) dropped — showing the last "
+                 f"{LOG_LINES_MAX})"] + lines
+    out["log"] = lines
+    return out
+
+
 def status() -> dict:
     return {"current": _CURRENT[0],
             "actions": {n: {"label": a["label"]} for n, a in ACTIONS.items()},
-            "jobs": {n: dict(j) for n, j in JOBS.items()}}
+            "jobs": {n: public_status(j) for n, j in JOBS.items()}}
 
 
 def bootstrap_compat() -> dict:

@@ -66,6 +66,23 @@ def test_sync_upserts_and_deactivates():
         os.unlink(path)
 
 
+def test_sync_reports_progress_as_it_pages():
+    """A full sync is minutes of paging on a real library, and it used to show as
+    "starting" on /admin the whole time while logging its progress to a log nobody
+    was watching. The counts have to MOVE, or the field is decoration."""
+    conn, path = make_db()
+    said = []
+    try:
+        client = subsonic.Client(base_url="http://test", transport=fake_transport())
+        sync.sync_library(conn, client, set_stage=said.append)
+    finally:
+        os.unlink(path)
+    assert said, "sync reported nothing"
+    assert any("2 albums" in s and "3 tracks" in s for s in said), said
+    # and it says what the tail end of a sync is doing — the deactivation pass
+    assert "reconciling" in said[-1]
+
+
 def test_error_status_raises():
     def handler(request):
         return httpx.Response(200, json={"subsonic-response": {

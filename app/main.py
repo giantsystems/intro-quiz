@@ -58,8 +58,25 @@ def health():
             playable = conn.execute(
                 f"SELECT COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} "
                 "AND tier IN ('easy','medium')").fetchone()["c"]
+            # DELIBERATELY still easy+medium only, despite the name: external
+            # watchers read this key and ready_to_play is the same population, so
+            # redefining it would move two meanings at once. The honest numbers
+            # live alongside it instead.
             out["tracks_playable"] = playable
             out["ready_to_play"] = playable >= 10
+            # Every tier, because the clip sweep cuts every tier: tracks_playable
+            # can sit still for hours of real cutting (hard and tiebreak are ~70%
+            # of this library), and a watcher reading only that key concluded the
+            # sweep was wedged. clips_remaining is the direct answer — it counts
+            # the same rows the cutter's next batch will draw from.
+            out["playable_by_tier"] = {
+                t: conn.execute(
+                    f"SELECT COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} AND tier=?",
+                    (t,)).fetchone()["c"]
+                for t in ("easy", "medium", "hard", "tiebreak")}
+            # same predicate as tracks_playable, just not restricted to two tiers
+            out["tracks_playable_all_tiers"] = sum(out["playable_by_tier"].values())
+            out["clips_remaining"] = clips.pending_count(conn)
             if not out["ready_to_play"]:
                 out["message"] = ("not enough clipped easy/medium tracks yet — run "
                                   "POST /api/sync, /api/score/lastfm (repeat), /api/score/tiers, "
@@ -196,20 +213,26 @@ def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
 
 @app.get("/api/round-filters/count")
 def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
-                            year_from: int | None = None, year_to: int | None = None):
+                            year_from: int | None = None, year_to: int | None = None,
+                            exclude_genres: str = ""):
     """How many tracks a specific combination leaves — the preflight for a real choice.
 
     Genres and decades are independently plausible and their INTERSECTION can still be
     empty ('Reggae' has 56 tracks and the 1960s has 208; the overlap may be zero). Without
     this the only feedback was GameError at the moment someone tapped Start.
+
+    exclude_genres is pipe-separated like genres. It counts here as well as at start, so
+    "everything except this one tag" gets the same locked-Start treatment as any other
+    choice — an exclusion wide enough to empty the pool must be caught before the tap.
     """
     tl = [t.strip() for t in tiers.split(",") if t.strip()]
     gl = [g for g in (genres.split("|") if genres else []) if g]
+    xl = [g for g in (exclude_genres.split("|") if exclude_genres else []) if g]
     if not tl:
         return Response(status_code=400, content="tiers must not be empty")
     conn = db.connect()
     try:
-        n = game.pool_count(conn, tl, gl, year_from, year_to)
+        n = game.pool_count(conn, tl, gl, year_from, year_to, xl)
         return {"tracks": n, "enough_for_10": n >= 10}
     finally:
         conn.close()
@@ -295,7 +318,7 @@ def _job_sync(set_stage) -> dict:
     try:
         client = subsonic.Client()
         client.ping()
-        return sync.sync_library(conn, client)
+        return sync.sync_library(conn, client, set_stage=set_stage)
     finally:
         conn.close()
 
@@ -333,7 +356,9 @@ def _job_tiers(set_stage) -> dict:
 
 
 def _job_clips(set_stage) -> dict:
-    return clips.sweep(max_hours=config.CLIP_SWEEP_MAX_HOURS)
+    """The multi-hour one. Its progress is the whole reason set_stage exists —
+    it used to be accepted and dropped, leaving `stage` on "starting" all run."""
+    return clips.sweep(max_hours=config.CLIP_SWEEP_MAX_HOURS, set_stage=set_stage)
 
 
 def _job_quality(set_stage) -> dict:
@@ -417,7 +442,10 @@ def _job_bootstrap(set_stage) -> dict:
     finally:
         conn.close()
     stage("clips")
-    r = clips.sweep()
+    # The sweep drives `stage` from here on: this is hours of the bootstrap's
+    # runtime, and a fixed "clips" for all of it is the same blind spot _job_clips
+    # had. Abort still works — the sweep polls cancelled() between items.
+    r = clips.sweep(set_stage=set_stage)
     out.update({"clips_cut": r.get("cut"), "clips_stopped": r.get("stopped")})
     return out
 
@@ -826,6 +854,7 @@ async def on_new_game(s: WSSession, msg: dict) -> None:
             tiers=msg.get("tiers") or ["easy", "medium"],
             # round filters — absent/empty means the whole library
             genres=msg.get("genres") or None,
+            exclude_genres=msg.get("exclude_genres") or None,
             year_from=msg.get("year_from"), year_to=msg.get("year_to"))
         trivia.ensure_seeded(conn)
     finally:
@@ -853,8 +882,13 @@ async def on_join(s: WSSession, msg: dict) -> None:
     # socket, so its next message isn't silently attributed to nobody.
     s.name = msg.get("name", "")
     s.hub.game.join(s.name, remote=bool(msg.get("remote")))
+    # Re-claimed in the spelling the game actually stored. Every host check is an
+    # equality test against g.host, so a phone that joined as `robin` while the
+    # lobby already held `Robin` would be handed Robin's slot and then refused
+    # control of Robin's own rounds.
+    s.name = s.hub.game.resolve_name(s.name)
     if s.hub.game.host is None and s.ws is s.hub.host_ws:
-        s.hub.game.host = s.name.strip()[:24]
+        s.hub.game.host = s.name
     await s.hub.broadcast()
 
 

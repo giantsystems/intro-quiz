@@ -313,6 +313,40 @@ def test_a_second_game_cannot_start_over_a_live_one(hub):
     assert s.ws.errors() == ["a game is already running"]
 
 
+def test_new_game_carries_the_round_filters_including_the_exclusion(hub):
+    """The handler is the seam the picker's choices cross. `genres` was already threaded;
+    `exclude_genres` reaching Game is what makes "everything except this tag" more than a
+    checkbox — a dropped key here plays the excluded genre with the UI insisting otherwise.
+    """
+    # the handler opens its OWN connection (pinned by `quiet`), so the pool has to exist
+    # there rather than in the fixture's game db
+    seeded = main.db.connect()
+    for i in range(12):
+        seeded.execute(
+            "INSERT INTO tracks(id,title,artist,album,genre,year,duration,tier,clipped_at,"
+            "global_listeners,active) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
+            (f"x{i}", f"Song {i}", f"Rock Band {i}", "Album", "Rock", 1995, 200, "easy",
+             "2026-07-06T00:00:00", 5000))
+    seeded.commit()
+    seeded.close()
+
+    hub.game.phase = "finished"
+    s = session(hub, "Alice")
+    send(s, type="new_game", genres=["Rock"], exclude_genres=["NotForKids"],
+         year_from=1990, year_to=1999)
+    assert s.ws.errors() == [], s.ws.errors()
+    assert hub.game.exclude_genres == ["NotForKids"]
+    assert "no NotForKids" in hub.game.filter_label(), \
+        "every phone and the board must say what was left out"
+    assert "IS NULL" in hub.game.filters[0], \
+        "an untagged track was never named for exclusion — see game.exclusion_sql"
+    # ...and a plain new_game stays unfiltered rather than picking up an empty exclusion
+    hub.game.phase = "finished"
+    send(session(hub, "Alice"), type="new_game")
+    assert hub.game.exclude_genres == []
+    assert hub.game.filter_label() == ""
+
+
 def test_a_sleeping_house_refuses_a_new_game_unless_forced(hub, monkeypatch):
     monkeypatch.setattr(main.ha, "house_is_sleeping", lambda: True)
     hub.game.phase = "finished"
@@ -376,6 +410,22 @@ def test_a_rejected_join_still_claims_the_socket(hub):
     s = session(hub)
     send(s, type="join", name="")
     assert s.name == "", "a failed join left the socket nameless"
+
+
+def test_a_case_variant_join_claims_the_socket_under_the_name_the_game_seated(hub):
+    """Players are folded by case, so joining as `alice` seats you as Alice. The
+    socket has to claim THAT spelling: every host and abandon check is an equality
+    test against g.host, so a master whose phone autocorrected their own name would
+    be handed their own seat and then refused control of their own rounds."""
+    s = session(hub)
+    send(s, type="join", name="alice")
+    assert s.name == "Alice"
+    assert list(hub.game.players) == ["Alice", "Bob"], "a second Alice joined"
+    for who in hub.game.players.values():   # clear the lobby's everyone-ready gate
+        who["ready"] = True
+    send(s, type="start_round")
+    assert s.ws.errors() == [], "the master was locked out of their own game"
+    assert hub.game.phase == "question"
 
 
 # --------------------------------------------------------------------------

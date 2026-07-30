@@ -11,7 +11,10 @@ from . import subsonic
 LOGGER = logging.getLogger(__name__)
 
 
-def sync_library(conn, client: subsonic.Client) -> dict:
+def sync_library(conn, client: subsonic.Client, set_stage=None) -> dict:
+    """Walk the library and upsert. `set_stage` is the job registry's callback:
+    a full sync is minutes of paging on a big library, and without it the admin
+    page showed "starting" throughout while this loop logged its progress."""
     seen: set[str] = set()
     albums = 0
     offset = 0
@@ -35,7 +38,11 @@ def sync_library(conn, client: subsonic.Client) -> dict:
                      s.get("duration"), s.get("coverArt")))
         offset += len(batch)
         LOGGER.info("synced %d albums so far", offset)
+        if set_stage:
+            set_stage(f"syncing — {albums} albums, {len(seen)} tracks so far")
     # anything not seen this pass is gone from the library
+    if set_stage:
+        set_stage(f"reconciling — {len(seen)} tracks seen")
     if seen:
         placeholders = ",".join("?" * len(seen))
         deactivated = conn.execute(

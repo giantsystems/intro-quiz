@@ -155,6 +155,31 @@ Worth knowing:
   instead — a boost is a bonus, not a promise, and a themed game shouldn't refuse to start
   because one person's favourites don't fit.
 
+## Leaving a genre out
+
+Under the theme pickers is a second wall: **tap a genre there and it's left out**, with the
+rest of the library still in play. Any number of them. The live count and the Start lock work
+exactly as they do for a theme, and the two walls can be combined ("Rock, but not Blues").
+
+Worth knowing:
+
+- This is **not** the same as ticking every other genre, which is why it exists. The picker
+  only lists genres above the 25-track floor, so a few hundred quizzable tracks carry a tag
+  that never appears as a checkbox — ticking round a genre silently loses them.
+- An exclusion leaves out **only what you named**. Tracks with **no genre tag at all** stay
+  in the game, because an untagged track wasn't named. (A theme behaves the opposite way, and
+  should: an untagged track can't be claimed for `Rock` either.)
+- Excluded genres are kept out of the **decoys** too. A themed round is allowed to widen its
+  decoy search past the theme when a narrow slice can't fill four options — it will never
+  widen past an exclusion, because decoys are read out loud like any other option.
+- Tapping a genre in one wall clears it from the other, so nothing can end up both wanted and
+  banned. If a client does send a genre in both lists, the **exclusion wins** and the pool
+  counts zero, which locks Start rather than quietly playing it.
+- The exclusion shows in the game label on the board and every phone ("no Blues"), because an
+  exclusion-only game otherwise looks identical to an unfiltered one.
+- Nothing to configure. Same endpoint as the theme count, with an extra pipe-separated param:
+  `GET /api/round-filters/count?exclude_genres=Blues|Jazz`.
+
 ## All-time top scores
 
 Every finished game writes each player's score to the database, and the totals show up in
