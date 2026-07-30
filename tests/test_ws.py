@@ -412,6 +412,22 @@ def test_a_rejected_join_still_claims_the_socket(hub):
     assert s.name == "", "a failed join left the socket nameless"
 
 
+def test_a_case_variant_join_claims_the_socket_under_the_name_the_game_seated(hub):
+    """Players are folded by case, so joining as `alice` seats you as Alice. The
+    socket has to claim THAT spelling: every host and abandon check is an equality
+    test against g.host, so a master whose phone autocorrected their own name would
+    be handed their own seat and then refused control of their own rounds."""
+    s = session(hub)
+    send(s, type="join", name="alice")
+    assert s.name == "Alice"
+    assert list(hub.game.players) == ["Alice", "Bob"], "a second Alice joined"
+    for who in hub.game.players.values():   # clear the lobby's everyone-ready gate
+        who["ready"] = True
+    send(s, type="start_round")
+    assert s.ws.errors() == [], "the master was locked out of their own game"
+    assert hub.game.phase == "question"
+
+
 # --------------------------------------------------------------------------
 # round flow
 # --------------------------------------------------------------------------

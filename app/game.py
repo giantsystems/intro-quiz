@@ -52,6 +52,25 @@ class GameError(RuntimeError):
     pass
 
 
+def display_name(name: str) -> str:
+    """The one spelling of a player's name the whole app shows: Title Case.
+
+    Names are folded by case, so `robin` and `Robin` are one player with one
+    all-time row. They used to accumulate as two, and a returning player lost
+    their history by typing a different capitalisation. Something then has to
+    choose the spelling to display, and Title Case is chosen for being
+    predictable rather than clever.
+
+    Deliberately simple, with a known cost: it flattens `JB` to `Jb` and
+    `McDonald` to `Mcdonald`. That was accepted, not overlooked — a table of
+    exceptions is upkeep with no end for a house quiz with a handful of
+    regulars. Refine it HERE if it ever grates; this is the only place the rule
+    lives. Game.join folds on casefold() separately, so a refinement that stops
+    being a total case fold still cannot split one player into two lobby slots.
+    """
+    return name.strip()[:24].title()
+
+
 # A year this far outside living memory is a broken tag, not a release date. Real junk in
 # this library: AFI's 'Miss Murder' is tagged 1212. Left alone it would be a "1210s" entry
 # in the decade picker, and a track that no decade filter could ever legitimately match.
@@ -312,12 +331,14 @@ class Game:
     def set_artists(self, name: str, artists: list[str]) -> None:
         if self.phase != "lobby":
             raise GameError("artists can only be picked in the lobby")
+        name = self.resolve_name(name)
         if name not in self.players:
             raise GameError("join first")
         self.players[name]["artists"] = [a for a in artists if isinstance(a, str)][:3]
         self.players[name]["ready"] = True
 
     def set_ready(self, name: str) -> None:
+        name = self.resolve_name(name)
         if name not in self.players:
             raise GameError("join first")
         self.players[name]["ready"] = True
@@ -360,8 +381,36 @@ class Game:
         self.rounds = [self._mk_round(conn, t) for t in picked]
 
     # -- lobby ---------------------------------------------------------------
+    def resolve_name(self, name: str) -> str:
+        """The single key this player is stored under, whatever spelling arrived.
+
+        Every entry point that takes a name runs it through here, so a phone that
+        joined as `robin` is not a stranger to `answer` or `set_artists` when the
+        lobby holds `Robin` — those membership checks would raise "join first"
+        mid-game. An unknown name comes back in display form, so a genuine
+        stranger still fails the checks that follow.
+
+        The case-insensitive scan is not redundant with display_name's Title Case,
+        it is what makes it safe to refine: if display_name ever stops being a
+        total case fold (to keep `McDonald`), two spellings must still land on one
+        player rather than quietly opening a second slot and a second score.
+        """
+        want = display_name(name)
+        for existing in self.players:
+            if existing.casefold() == want.casefold():
+                return existing
+        return want
+
     def join(self, name: str, remote: bool = False) -> None:
-        name = name.strip()[:24]
+        """Take, or retake, a seat.
+
+        A case-variant of a name already in the lobby is the SAME player: joining
+        as `robin` while `Robin` is playing hands back Robin's slot and score
+        instead of opening a second one. Two slots would also put two spellings
+        into `results` for one game — the primary key there is (game_id, player),
+        so it would happily take both (db.py).
+        """
+        name = self.resolve_name(name)
         if not name:
             raise GameError("empty name")
         fresh = name not in self.players
@@ -375,6 +424,7 @@ class Game:
     def set_remote(self, name: str, remote: bool) -> None:
         """In the room or not. Changeable any time — someone can wander off with
         their phone mid-game, or turn up in person after joining from the car."""
+        name = self.resolve_name(name)
         if name not in self.players:
             raise GameError("join first")
         self.players[name]["remote"] = bool(remote)
@@ -462,6 +512,7 @@ class Game:
         """
         if self.phase != "question" or self.current < 0:
             return
+        name = self.resolve_name(name)
         if not self.players.get(name, {}).get("remote"):
             return  # locals hear the room; their baseline is the room clock
         rnd = self.rounds[self.current]
@@ -484,6 +535,7 @@ class Game:
 
     def answer(self, name: str, choice: int) -> dict:
         rnd = self._round("question")
+        name = self.resolve_name(name)
         if name not in self.players:
             raise GameError("join first")
         if name in rnd["answers"]:
@@ -564,6 +616,7 @@ class Game:
 
     def tf_answer(self, name: str, val: bool) -> None:
         q = self._tf_current()
+        name = self.resolve_name(name)
         if name not in self.players:
             raise GameError("join first")
         if q["revealed"]:
@@ -699,7 +752,15 @@ class Game:
 
 
 def all_time_leaderboard(conn, limit: int = 20) -> list[dict]:
-    return [dict(r) for r in conn.execute(
+    """One row per player across every game — case-folded, so one person is one row.
+
+    `results.player` is plain TEXT and older rows can hold any spelling, so the
+    grouping has to fold rather than trust what was stored. GROUP BY ... COLLATE
+    NOCASE hands back an ARBITRARY member spelling for the SELECTed column, which
+    would make the name on the board depend on which row SQLite happened to pick;
+    display_name() over the top makes it deterministic instead.
+    """
+    return [dict(r, player=display_name(r["player"])) for r in conn.execute(
         "SELECT player, COUNT(*) games, SUM(score) total_score, SUM(correct) total_correct, "
-        "MIN(fastest_ms) fastest_ms FROM results GROUP BY player "
+        "MIN(fastest_ms) fastest_ms FROM results GROUP BY player COLLATE NOCASE "
         "ORDER BY total_score DESC LIMIT ?", (limit,))]

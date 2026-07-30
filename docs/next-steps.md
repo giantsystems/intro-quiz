@@ -13,7 +13,7 @@ v1.33.0 is tagged, released, and running in production. It shipped five improvem
 genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
-- **Tests:** 227 python + two node smokes (`make test`, `make test-js`). All green.
+- **Tests:** 249 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
 - **Library:** 23,083 tracks synced, 22,888 tiered
   (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
@@ -21,7 +21,7 @@ abortable admin jobs with an honest 409, and the websocket handler table.
   resumes on each container start and **needs re-running after any deploy** that
   restarts the container mid-sweep.
 - **Leaderboard:** empty. `rounds_played: 0` — no games have been played to completion
-  since the database was last dealt with. This matters for item 2.
+  since the database was last dealt with. That emptiness is what made item 2 free to fix.
 
 Read [fork-changes.md](fork-changes.md) before touching anything that might conflict with
 upstream, and [development.md](development.md) to get a local environment without
@@ -29,58 +29,74 @@ Navidrome, Home Assistant or Docker.
 
 ---
 
-## 1. Make job progress tell the truth
+## 1. Make job progress tell the truth — DONE
 
-**Cost:** half a day. **Do this first.**
+All three lies are fixed. What they were, and what replaced each:
 
-Three different progress signals lie, and all three have already caused a wrong call:
+- `_job_clips` accepted `set_stage` and threw it away, so `stage` read `"starting"` for
+  the sweep's entire multi-hour run. `clips.sweep` now takes the callback and reports
+  cut-so-far and remaining — **per clip**, not just per batch, because a 100-clip batch
+  is up to an hour and a frozen field for an hour is exactly what got misread. A stalled
+  sweep now says `backing off … (attempt 2 of 6)`, which is the one state that
+  legitimately looks stuck. `sync_library` had the same hole and got the same treatment.
+- `RunLogHandler.emit` kept the **first** 100 lines, so the "tail" was the head and its
+  newest line was hours old the moment the log filled. The sink is a `deque(maxlen=…)`;
+  dropped lines are counted in `log_dropped` and spelled out as a leading note where the
+  API serves it, so truncation is still distinguishable from a short log.
+- `/health`'s `tracks_playable` counts easy+medium while the sweep cuts every tier.
+  **Its meaning is unchanged** — external watchers read that key and `ready_to_play` is
+  the same population — so `playable_by_tier`, `tracks_playable_all_tiers` and
+  `clips_remaining` were added alongside it instead. `clips_remaining` is the direct
+  answer to "is the sweep making progress": it counts the same rows the cutter's next
+  batch will draw from. The name `tracks_playable` still reads like a total and still
+  isn't one; renaming it would break the watchers, so it stays.
 
-- `_job_clips` ([main.py:335](../app/main.py#L335)) accepts `set_stage` and **throws it
-  away**, so `stage` reads `"starting"` for the sweep's entire multi-hour run.
-- `RunLogHandler.emit` ([jobs.py:84](../app/jobs.py#L84)) keeps the **first**
-  `LOG_LINES_MAX` (100) lines and then appends `… (output capped)`. The "tail" is the
-  head. An 11-hour-old last line means the log filled up, not that the job stalled.
-- `/health`'s `tracks_playable` ([main.py:59](../app/main.py#L59)) counts
-  **easy+medium only**, while the sweep cuts every tier — so it can sit still while
-  real work happens.
+The cost of the old proxies, for the record: on 2026-07-30 they had the sweep declared
+wedged three times, wrongly, and aborted — ~11 hours of cutting, resumable, so nothing
+was lost permanently. `ls $CLIPS_HOST_DIR | wc -l` twice a minute apart is no longer the
+only trustworthy check, though it remains the ground truth the fields are judged against.
 
-**Why it's worth doing:** on 2026-07-30 these three proxies led to the sweep being
-declared wedged three times, wrongly, and then aborted — costing ~11 hours of cutting
-(resumable, so nothing was lost permanently). Right now the only reliable progress check
-is SSHing in and counting files: `ls $CLIPS_HOST_DIR | wc -l` twice, ~50s apart, which
-should show 15–25 new clips.
+Every claim above has a test that fails if the fix is reverted; each was proved by
+injecting the old behaviour back. The log-tail test asserts *which* lines survived
+rather than how many — a length check passes with a first-N sink too.
 
-**Why it's cheap:** `clips.sweep` **already computes `remaining` on every batch**
-([clips.py:238](../app/clips.py#L238)) and simply has nowhere to put it. Thread
-`set_stage` through, and change the log sink to a `deque(maxlen=…)` so the tail is
-genuinely the tail. Consider reporting all four tiers in `/health`, or renaming the
-field so it stops reading like a total.
+## 2. Fold leaderboard names by case — **DONE**
 
-**Test it by** asserting `stage` changes between two batches of a faked sweep, and that
-a log of 200 lines retains the *last* ones.
+Done on 2026-07-30, inside the window: the production leaderboard was still empty
+(`rounds_played: 0`), so no data migration was needed and none was written.
 
-## 2. Fold leaderboard names by case
+`all_time_leaderboard` now groups `COLLATE NOCASE`
+([game.py:697](../app/game.py#L697)), and the lobby treats a case-variant of an existing
+name as the SAME player ([game.py:333](../app/game.py#L333)) — joining as `robin` while
+`Robin` is playing hands back Robin's seat and score instead of opening a second one.
+That mattered beyond the leaderboard: `results` is keyed `(game_id, player)`
+([db.py:49-56](../app/db.py#L49-L56)), so two spellings would have split one night's
+score in two before the all-time query ever saw it.
 
-**Cost:** half a day. **Do it now rather than later — see the timing note.**
+Two decisions worth knowing about, both deliberate:
 
-`all_time_leaderboard` ([game.py:644](../app/game.py#L644)) does `GROUP BY player` on a
-plain `TEXT` column, and `join` ([game.py:313](../app/game.py#L313)) only normalises with
-`.strip()[:24]`. So `steve` and `Steve` accumulate as two separate all-time rows, and a
-returning player silently loses their history by typing a lowercase name.
+- **Display is Title Case, always** — one function, `display_name`
+  ([game.py:55](../app/game.py#L55)). It is applied over the grouped rows because
+  `GROUP BY ... COLLATE NOCASE` returns an *arbitrary* member spelling for the selected
+  column, so without it the name on the board depended on which row SQLite happened to
+  pick. The accepted cost is that it flattens `JB` to `Jb` and `McDonald` to `Mcdonald`.
+  Refine it there if it ever grates; `resolve_name` folds on `casefold()` separately, so a
+  refinement that stops being a total case fold still cannot split one player into two
+  seats.
+- **Every entry point resolves the name, not just `join`.** The phone keeps sending the
+  spelling the player typed on `answer`, `ready` and the rest, and all of those check
+  membership — folding only in `join` would have seated `robin` as `Robin` and then told
+  them "join first" for the whole game. `on_join` re-claims the socket's name in the
+  seated spelling too ([main.py:860](../app/main.py#L860)), or a master whose phone
+  autocapitalised would be refused control of their own rounds. On the phone,
+  `adoptSeatedName` ([quiz.js:97](../app/static/quiz.js#L97)) takes the server's spelling
+  so the "is this me?" comparisons in `render()` keep working.
 
-**Timing is the whole point:** the production leaderboard is **currently empty**, so this
-is latent. Fixed now it's a `COLLATE NOCASE` on the group-by plus a decision about which
-capitalisation to display. Fixed after real history accrues, it's merging rows by hand and
-adjudicating whose score is whose. The window is open; it closes the first time someone
-finishes a game.
-
-Note the `results` primary key is `(game_id, player)`
-([db.py:49-56](../app/db.py#L49-L56)), so two spellings can also coexist *within* one
-game. Decide whether `join` should reject a name that differs only by case from one
-already in the lobby.
-
-**Test it by** inserting mixed-case rows and asserting one grouped row out, and that the
-displayed name is the one you chose deliberately.
+**Tests:** 9 new (236 python total). Each was verified by reverting the fix and watching
+it fail — including the two subtle ones: `COLLATE NOCASE` *without* `display_name` still
+passes a naive one-row assertion, and folding only in `join` passes everything except a
+full game played under mixed spellings. The board needed no change; it renders snapshot
+keys and the already-folded API rows.
 
 ## 3. Cover the HTTP surface, starting with the answer-leak guard
 

@@ -390,6 +390,41 @@ global.__remoteChecks = async () => {
     console.log("empty leaderboard not explained:", atList.innerHTML); failures++; }
   leaderboardRows = LEADERBOARD;
 
+  // 6. it's still YOUR row when you typed your name in a different case. The
+  //    leaderboard is folded and displayed in Title Case server-side, but this
+  //    card also shows BEFORE joining, when myName is only ever what was typed
+  //    or restored from localStorage.
+  alltimeKey = ""; joined = false; myName = "bob";
+  state = { phase: "idle", players: [] }; render(); await settle();
+  const lcRows = atList.innerHTML.split("<span").filter(r => /Alice|Bob|Carol/.test(r));
+  const lcRowFor = (who) => lcRows.find(r => r.includes(who)) || "";
+  if (!/accent/.test(lcRowFor("Bob"))) {
+    console.log("lowercase name lost its own all-time row:", lcRowFor("Bob")); failures++; }
+  if (/accent/.test(lcRowFor("Alice"))) {
+    console.log("someone else's row highlighted for a lowercase name:", lcRowFor("Alice")); failures++; }
+
+  // ---- the server owns the spelling of your name ----------------------------
+  // Joining as "alice" seats you as "Alice" (names are folded by case). Every
+  // "is this me?" check in render() would then compare the typed spelling against
+  // the canonical one and say no all game: no master banner, no half-time fact.
+  myName = "alice"; joined = true;
+  state = ${JSON.stringify(snapshots[2])};
+  adoptSeatedName(); render();
+  if (myName !== "Alice") { console.log("did not adopt the seated spelling:", myName); failures++; }
+  const mb2 = document.getElementById("master-banner");
+  if (!/game master/.test(mb2.innerHTML)) {
+    console.log("master locked out of their own banner by their own capitalisation:", mb2.innerHTML);
+    failures++; }
+  // and the half-time fact, which is keyed by the server's spelling
+  myName = "alice"; state = ${JSON.stringify(snapshots[6])};
+  adoptSeatedName(); render();
+  if (document.getElementById("bk-fact").hidden) {
+    console.log("fact card hidden from its owner after a lowercase join"); failures++; }
+  // a name that is NOT in the roster is left exactly as typed — adopting the
+  // nearest row would rename a spectator into a player
+  myName = "Trevor"; adoptSeatedName();
+  if (myName !== "Trevor") { console.log("a non-player's name was rewritten:", myName); failures++; }
+
   // -- round filters on the idle screen ------------------------------------
   // The pool preflight is the point of this UI: genre and decade are each plausible while
   // their INTERSECTION is empty, so a choice that can't fill a game must lock Start HERE

@@ -78,6 +78,7 @@ function connect() {
         joined = false;  // fresh roster — everyone joins the new game
       }
       state = msg;
+      adoptSeatedName();
       if (state.phase !== "question" || state.round !== prevRound) myPick = null;
       if (state.phase === "idle") { artistsSent = false; myArtists = []; }
       render();
@@ -86,6 +87,20 @@ function connect() {
     }
   };
   ws.onclose = () => scheduleReconnect();
+}
+
+// The server owns the spelling of a name: it folds players by case, so joining as
+// "robin" seats you as "Robin". Adopt whatever it actually seated us as, or every
+// `=== myName` comparison in render() — am I the master? which half-time fact is
+// mine? which score line is highlighted? — tests the typed spelling against the
+// canonical one and quietly says no for the whole game.
+function adoptSeatedName() {
+  if (!myName) return;
+  const mine = (state.players || []).find(
+    p => p.name.toLowerCase() === myName.toLowerCase());
+  if (!mine || mine.name === myName) return;
+  myName = mine.name;
+  localStorage.setItem("quizName", myName);
 }
 
 function send(obj) {
@@ -384,8 +399,11 @@ function renderAlltime() {
     rows.slice(0, 8).forEach((r, i) => {
       const li = document.createElement("li");
       // own row highlighted: on a phone this list is the only place you see
-      // where you stand across every game, not just this one
-      const me = r.player === myName;
+      // where you stand across every game, not just this one. Folded, because
+      // this card also shows BEFORE joining, when myName is still whatever was
+      // typed or restored from localStorage — the server only hands back the
+      // folded spelling once you're in the roster.
+      const me = r.player.toLowerCase() === myName.toLowerCase();
       li.innerHTML =
         `<span${me ? ' style="color:var(--accent);font-weight:700"' : ""}>` +
         `${["🥇","🥈","🥉"][i] || "&nbsp;&nbsp;"} ${r.player}</span>` +
