@@ -13,7 +13,7 @@ v1.33.0 is tagged, released, and running in production. It shipped five improvem
 genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
-- **Tests:** 227 python + two node smokes (`make test`, `make test-js`). All green.
+- **Tests:** 240 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
 - **Library:** 23,083 tracks synced, 22,888 tiered
   (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
@@ -29,35 +29,36 @@ Navidrome, Home Assistant or Docker.
 
 ---
 
-## 1. Make job progress tell the truth
+## 1. Make job progress tell the truth — DONE
 
-**Cost:** half a day. **Do this first.**
+All three lies are fixed. What they were, and what replaced each:
 
-Three different progress signals lie, and all three have already caused a wrong call:
+- `_job_clips` accepted `set_stage` and threw it away, so `stage` read `"starting"` for
+  the sweep's entire multi-hour run. `clips.sweep` now takes the callback and reports
+  cut-so-far and remaining — **per clip**, not just per batch, because a 100-clip batch
+  is up to an hour and a frozen field for an hour is exactly what got misread. A stalled
+  sweep now says `backing off … (attempt 2 of 6)`, which is the one state that
+  legitimately looks stuck. `sync_library` had the same hole and got the same treatment.
+- `RunLogHandler.emit` kept the **first** 100 lines, so the "tail" was the head and its
+  newest line was hours old the moment the log filled. The sink is a `deque(maxlen=…)`;
+  dropped lines are counted in `log_dropped` and spelled out as a leading note where the
+  API serves it, so truncation is still distinguishable from a short log.
+- `/health`'s `tracks_playable` counts easy+medium while the sweep cuts every tier.
+  **Its meaning is unchanged** — external watchers read that key and `ready_to_play` is
+  the same population — so `playable_by_tier`, `tracks_playable_all_tiers` and
+  `clips_remaining` were added alongside it instead. `clips_remaining` is the direct
+  answer to "is the sweep making progress": it counts the same rows the cutter's next
+  batch will draw from. The name `tracks_playable` still reads like a total and still
+  isn't one; renaming it would break the watchers, so it stays.
 
-- `_job_clips` ([main.py:335](../app/main.py#L335)) accepts `set_stage` and **throws it
-  away**, so `stage` reads `"starting"` for the sweep's entire multi-hour run.
-- `RunLogHandler.emit` ([jobs.py:84](../app/jobs.py#L84)) keeps the **first**
-  `LOG_LINES_MAX` (100) lines and then appends `… (output capped)`. The "tail" is the
-  head. An 11-hour-old last line means the log filled up, not that the job stalled.
-- `/health`'s `tracks_playable` ([main.py:59](../app/main.py#L59)) counts
-  **easy+medium only**, while the sweep cuts every tier — so it can sit still while
-  real work happens.
+The cost of the old proxies, for the record: on 2026-07-30 they had the sweep declared
+wedged three times, wrongly, and aborted — ~11 hours of cutting, resumable, so nothing
+was lost permanently. `ls $CLIPS_HOST_DIR | wc -l` twice a minute apart is no longer the
+only trustworthy check, though it remains the ground truth the fields are judged against.
 
-**Why it's worth doing:** on 2026-07-30 these three proxies led to the sweep being
-declared wedged three times, wrongly, and then aborted — costing ~11 hours of cutting
-(resumable, so nothing was lost permanently). Right now the only reliable progress check
-is SSHing in and counting files: `ls $CLIPS_HOST_DIR | wc -l` twice, ~50s apart, which
-should show 15–25 new clips.
-
-**Why it's cheap:** `clips.sweep` **already computes `remaining` on every batch**
-([clips.py:238](../app/clips.py#L238)) and simply has nowhere to put it. Thread
-`set_stage` through, and change the log sink to a `deque(maxlen=…)` so the tail is
-genuinely the tail. Consider reporting all four tiers in `/health`, or renaming the
-field so it stops reading like a total.
-
-**Test it by** asserting `stage` changes between two batches of a faked sweep, and that
-a log of 200 lines retains the *last* ones.
+Every claim above has a test that fails if the fix is reverted; each was proved by
+injecting the old behaviour back. The log-tail test asserts *which* lines survived
+rather than how many — a length check passes with a first-N sink too.
 
 ## 2. Fold leaderboard names by case
 
