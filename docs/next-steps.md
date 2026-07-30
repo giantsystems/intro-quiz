@@ -1,11 +1,19 @@
 # Next steps
 
-Where the work stands and what's worth doing next, easiest first. Written 2026-07-30 at
-v1.33.0 — every claim below was checked against the code or the running server at that
-point, with file references so you can re-check rather than trust it.
+Where the work stands and what's worth doing next. Written 2026-07-30 at v1.33.0 — every
+claim below was checked against the code or the running server at that point, with file
+references so you can re-check rather than trust it.
+
+Two sections. **Items 1–5** are improvements found by reading the code, easiest first.
+**Items 6–11** were requested by the project's owner, listed in the order asked. The split
+matters: the second group is what someone actually wants, so prefer it when the two
+compete, even though several are dearer.
 
 Nothing here is committed to. Each item says what's actually wrong, why it's worth
 doing, and what it costs; if a better idea turns up, do that instead.
+
+**Cheap wins, if you want a short list:** items 1, 2 and 6 are half a day to a day each,
+and item 8 may be mostly layout. Items 4 and 11 have hard prerequisites, stated in place.
 
 ## Where things stand
 
@@ -143,6 +151,163 @@ restart mid-game? If the honest answer is "almost never", then a clear *"that ga
 lost — start a new one"* on reconnect delivers most of the value for a fraction of the
 work. Decide that before writing anything; the full version is only worth a week if
 mid-game restarts actually happen.
+
+---
+
+# Requested features
+
+Asked for on 2026-07-30, listed in the order they were requested rather than by cost.
+The cost estimates and the notes on what's already in place were checked against the code
+the same day. Items 6 and 8 are cheap and could go alongside items 1–2 above; item 11 is
+explicitly a maybe-never.
+
+## 6. Exclude genres from a game
+
+**Cost:** a day. **Cheap, and there's a concrete reason to want it.**
+
+`filter_sql` ([game.py:80-82](../app/game.py#L80-L82)) only supports `genre IN (...)` —
+include-only. Excluding means adding a `NOT IN` arm, plus somewhere in the UI to express
+it, plus threading it through `pool_count` and the preflight the same way genres already
+are.
+
+**The use case is already visible in the library:** the tags include **`NotForKids` with
+144 tracks**. Excluding one tag is the natural way to say "family game, skip those",
+and today the only way to get that is to tick the other 19 genres.
+
+**The subtlety that decides the design:** exclude is *not* the same as ticking everything
+else. The picker only offers genres with at least `min_tracks` (25) tracks — 20 of them,
+covering 6,327 of the 6,607 quizzable tracks. **280 tracks (4%) have a genre that isn't
+in the picker at all**, or none. Ticking all 20 includes those 280 nowhere; `NOT IN
+('NotForKids')` includes them all. Both are defensible, but they're different games, and
+whichever you pick should be what the UI plainly says. Note also that a track has one
+`genre` value, so exclusion can't miss a track via a second tag.
+
+Watch the interaction with the existing preflight: exclusion shrinks the pool too, so
+`enough_for_10` must account for it, and the `filter_label`
+([game.py:580](../app/game.py#L580)) needs to read sensibly for a negative filter.
+
+## 7. Optional admin login on the landing page, with navigation
+
+**Cost:** 1–2 days. **The auth primitive already exists — this is mostly UI.**
+
+Today `/admin` is reachable only by knowing the URL, and admin auth is a token in
+`localStorage` sent as an `X-Admin-Token` header ([admin.js:13,29](../app/static/admin.js#L13),
+checked by `require_admin` at [main.py:25](../app/main.py#L25)). `admin.js` already
+`prompt()`s for the password on a 401 and stores it. So the mechanism works; what's
+missing is a way in from the front page and a way to move around once you're in.
+
+**The requirement that shapes it:** logging in must be entirely optional, and a normal
+player who ignores it sees today's join screen unchanged. So this is an unobtrusive
+control on the landing page — not a login wall — that, once used, reveals links to
+`/admin`, `/health`, `/board` and **back to the game in progress**, switchable without
+retyping a URL.
+
+Two things worth deciding early. First, `ADMIN_PASSWORD` may be **unset**, in which case
+`check_token` ([jobs.py:68-70](../app/jobs.py#L68)) treats everything as open — decide
+whether the button appears at all then, or admits everyone. Second, this is a real
+security boundary being made discoverable: today obscurity is part of the protection, and
+a visible button removes that. `X-Admin-Token` is a header rather than a cookie, so it
+isn't sent cross-site, but it also isn't a session — there's no expiry and no logout.
+Add a logout that clears `localStorage` at minimum.
+
+## 8. Show more on the scoreboard
+
+**Cost:** 1–2 days. **Partly already there — check before rebuilding.**
+
+The request is: who's local and who's remote, a sensible no-game-active state, the current
+round, and who got the last one right. Three of those four exist in some form:
+
+- **Remote marker** — 🌐 already renders per player
+  ([board.html:367](../app/static/board.html#L367)).
+- **Who got it right** — already shown at reveal as `name ✅ +points` / `name ❌`
+  ([board.html:334-340](../app/static/board.html#L334)).
+- **Round number** — `round` and `total_rounds` are both in the snapshot
+  ([game.py:596-597](../app/game.py#L596)); whether they're *prominent* is the question.
+- **Idle state** — there is a `#b-idle` card ([board.html:46](../app/static/board.html#L46)),
+  currently the join QR.
+
+So read the board on a real screen first and decide what's genuinely missing versus what's
+present but too small or too transient. This is likely a layout and prominence job rather
+than new plumbing — and if any new *data* is needed, that's a `snapshot()` change
+([game.py:591](../app/game.py#L591)) which the phone UI and both node smokes also read.
+Keep `make test-js` green; it renders every phase for exactly this reason.
+
+## 9. Discover Chromecasts from /admin and pick one in flight
+
+**Cost:** 2–3 days, and **one infrastructure question decides whether it works at all.**
+
+Today `DISPLAYS` is parsed from the environment **at import time** as hardcoded `Name=ip`
+pairs ([board_cast.py:12-19](../app/board_cast.py#L12-L19)) — there is no discovery. Worth
+knowing: **`DISPLAYS` is not set in production**, so casting is currently unconfigured
+altogether. This item is what would make it usable without hand-collecting IPs.
+
+The good news: the pinned `pychromecast` 14.0.10 does expose discovery —
+`get_chromecasts()`, `discover_chromecasts()`, `start_discovery()`. So the library can do
+it.
+
+**The blocker to check first:** discovery is mDNS/zeroconf multicast, and
+`docker-compose.yml` uses **default bridge networking with a published port**. Multicast
+does not cross a bridge network, so `get_chromecasts()` inside the container will most
+likely find **nothing**, while the existing `get_chromecast_from_host()` path keeps working
+because it connects to a known IP directly. Establish this before building any UI —
+probe from inside the running container. If it can't see anything, the options are
+`network_mode: host` (which changes port publishing and interacts with SELinux on this
+host), a `known_hosts` list (helpful, but that's back to typing IPs), or discovery on the
+host with the result passed in. That choice is the whole shape of the feature.
+
+Also note the existing "pick in flight" pattern to copy rather than reinvent: the `hub`
+already holds a mutable `display` and the `set_display` websocket handler already swaps
+it, hiding the old board first ([main.py:786-788](../app/main.py#L786)). Discovery should
+feed that mechanism, not replace it. Cast failures must stay non-fatal — `show_board`
+swallows exceptions on purpose ([board_cast.py:68](../app/board_cast.py#L68)), because the
+board is cosmetic and must never break a game.
+
+## 10. A display-only dashboard page for AirPlay
+
+**Cost:** 1–2 days. **The pragmatic answer to the Apple TV problem, and it's a real gap.**
+
+Apple TV was investigated before and **shelved as genuinely impossible**: HA can control
+the TVs, but tvOS has no browser in any source list, so `select_source` and `play_media`
+cannot put a web page on one. Mirroring a browser from another device sidesteps that
+entirely, and needs nothing from HA.
+
+`/board` is already a plain page any browser can open
+([main.py:1047](../app/main.py#L1047)), so you can *almost* do this today. **The reason a
+separate page is the right call:** `/board` plays the round audio — it owns an
+`AudioContext` and fetches every clip ([board.html:123-194](../app/static/board.html#L123)),
+including the "Tap anywhere for sound" unlock overlay. AirPlay-mirroring it would send the
+clip out of the TV *as well as* the room speaker: echo, and a second unlock tap on a
+device nobody is holding.
+
+So the deliverable is a **display-only** view: same state feed over the websocket, same
+scoreboard, **no audio path at all** and no unlock overlay. Factor the render out of
+`board.html` rather than forking it, or the two drift. This pairs naturally with item 8 —
+same rendering work, and a mirrored screen is exactly where a better scoreboard pays off.
+
+Set expectations honestly in the doc you write: starting the mirror is a manual
+Control Centre action on the iPad or Mac. The server cannot initiate it, and that's a
+platform limit, not a shortcoming to fix later.
+
+## 11. Multiple concurrent games
+
+**Cost:** weeks. **Explicitly a maybe-never — the requester said so, and the code agrees.**
+
+`hub = Hub()` is a **module-level singleton** ([main.py:624](../app/main.py#L624))
+referenced **121 times** in `main.py`. Every websocket handler takes its hub from the
+session, every HTTP route reads the global, and neither `board.html` nor `quiz.js` has any
+concept of a room or game id — **zero occurrences** in either. So this isn't a feature
+you add, it's a change of shape: every route, both clients, and the websocket protocol all
+grow a room dimension.
+
+It's worse than a naming problem, because real single-instance resources are bound to that
+singleton and cannot simply be duplicated: `hub.display` is one cast display,
+`group_snapshot` is one set of grouped speakers, and the house speaker is one speaker. Two
+concurrent games cannot both own them. That's a product decision — do rooms share a board,
+or does only one game get audio? — not a refactor.
+
+**If it's ever wanted, do items 3 (route coverage) and 4 (split `main.py`) first.** Having
+the routes tested and the module split is the difference between a hard change and an
+unsafe one. Until then this is a note about why the code looks the way it does, not a plan.
 
 ---
 
