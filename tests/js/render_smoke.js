@@ -430,6 +430,7 @@ global.__remoteChecks = async () => {
   // their INTERSECTION is empty, so a choice that can't fill a game must lock Start HERE
   // rather than being refused by the server at the moment of the tap.
   const gbox = document.getElementById("genre-choice");
+  const xbox = document.getElementById("exclude-choice");
   const dbox = document.getElementById("decade-choice");
   const startBtn = document.getElementById("start-game");
   const countTxt = document.getElementById("filter-count");
@@ -475,6 +476,53 @@ global.__remoteChecks = async () => {
   countKey = "";
   toggleGenre("Rock"); toggleGenre("Reggae"); toggleDecade(1990); await settle();
   if (startBtn.disabled) { console.log("Start still locked after clearing the filters"); failures++; }
+
+  // -- "everything except..." ----------------------------------------------
+  // Not the same as ticking the other genres: the picker only lists tags above min_tracks,
+  // so ticking round a genre quietly loses every track whose tag never made the list.
+  if (!/Reggae/.test(xbox.innerHTML)) {
+    console.log("exclusion picker missing its genres:", xbox.innerHTML); failures++; }
+  const countUrls = () => fetched.filter(u => typeof u === "string"
+                                         && u.startsWith("/api/round-filters/count"));
+
+  // excluding on its own counts the pool and sends the exclusion on the query string
+  fetched.length = 0; sent.length = 0; countKey = "";
+  toggleBannedGenre("Reggae"); await settle();
+  const xq = countUrls().pop() || "";
+  if (!/exclude_genres=Reggae/.test(xq)) {
+    console.log("exclusion not sent to the preflight:", xq); failures++; }
+  if (!/400 songs/.test(countTxt.textContent)) {
+    console.log("pool not counted for an exclusion-only choice:", countTxt.textContent); failures++; }
+  startGame();
+  const ngx = sent.filter(m => m.type === "new_game").pop();
+  if (!ngx || JSON.stringify(ngx.exclude_genres) !== JSON.stringify(["Reggae"])) {
+    console.log("new_game did not carry the exclusion:", JSON.stringify(ngx)); failures++; }
+  if (ngx && ngx.genres) {
+    console.log("an exclusion-only game must not narrow to a genre:", JSON.stringify(ngx)); failures++; }
+
+  // the same genre included AND excluded resolves to zero tracks server-side, so the second
+  // tap MOVES it rather than leaving the host staring at an empty pool they can't explain
+  countKey = "";
+  toggleGenre("Reggae"); await settle();
+  if (bannedGenres.has("Reggae")) {
+    console.log("Reggae is both wanted and banned at once"); failures++; }
+  countKey = "";
+  toggleBannedGenre("Reggae"); await settle();
+  if (pickedGenres.has("Reggae")) {
+    console.log("banning a genre left it in the include list too"); failures++; }
+
+  // an exclusion wide enough to empty the library locks Start like any other narrow choice
+  filterCount = 2; countKey = "";
+  toggleBannedGenre("Pop"); await settle();
+  if (!startBtn.disabled) { console.log("Start not locked on a 2-song pool after excluding"); failures++; }
+  filterCount = 400;
+  countKey = "";
+  toggleBannedGenre("Pop"); toggleBannedGenre("Reggae"); await settle();
+  if (startBtn.disabled) { console.log("Start still locked after clearing the exclusions"); failures++; }
+  sent.length = 0; startGame();
+  const ngClean = sent.filter(m => m.type === "new_game").pop();
+  if (ngClean && ngClean.exclude_genres) {
+    console.log("cleared exclusions still sent:", JSON.stringify(ngClean)); failures++; }
 
   // and a themed game says so all game long, on every screen
   state = { ...${JSON.stringify(snapshots[2])}, filter_label: "Rock · the 1990s" };

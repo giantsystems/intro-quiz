@@ -966,6 +966,221 @@ def test_filter_label_reads_like_a_person_wrote_it():
         conn.close(); os.unlink(p)
 
 
+# -- genre exclusion ("everything except...") -------------------------------
+
+def test_excluding_a_genre_drops_exactly_those_tracks_and_keeps_the_rest():
+    """The real ask: one tag in this library sits on tracks that shouldn't come up at a
+    family quiz. Saying so must not be a choice between that and the whole library."""
+    conn, p = make_db(0)
+    try:
+        for i in range(6):
+            _insert_f(conn, f"adult{i}", f"Adult Act {i}", "NotForKids", 1995)
+        for i in range(6):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        for i in range(6):
+            _insert_f(conn, f"rock{i}", f"Rock Band {i}", "Rock", 1995)
+        picked = game.pick_tracks(conn, 12, ["easy"],
+                                  filters=game.filter_sql(exclude_genres=["NotForKids"]))
+        assert len(picked) == 12, "everything but the excluded genre is still eligible"
+        assert {t["genre"] for t in picked} == {"Pop", "Rock"}
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_an_untagged_track_survives_an_exclusion():
+    """THE regression guard, and the reason the fragment is written the way it is.
+
+    SQL's three-valued logic makes `NULL NOT IN ('X')` evaluate to NULL, not true, so the
+    obvious `genre NOT IN (...)` silently drops every track with no genre tag — hundreds of
+    quizzable tracks in this library. The chosen semantics are "exclude only what I named",
+    and an untagged track was never named. Verified against SQLite over the rows
+    ['Pop', 'X', NULL, 'Obscure']: the bare NOT IN returns Pop and Obscure only.
+    """
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "adult", "Adult Act", "NotForKids", 1995)
+        _insert_f(conn, "untagged", "Untagged Band", None, 1995)
+        _insert_f(conn, "obscure", "Obscure Act", "Sea Shanty", 1995)
+        for i in range(4):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        frag, params = game.filter_sql(exclude_genres=["NotForKids"])
+        picked = game.pick_tracks(conn, 6, ["easy"], filters=(frag, params))
+        ids = {t["id"] for t in picked}
+        assert "untagged" in ids, \
+            "a NULL genre was never named for exclusion — a bare NOT IN loses it"
+        assert "obscure" in ids, "a genre too small for the picker is still eligible"
+        assert "adult" not in ids
+        assert "IS NULL" in frag, \
+            "the NULL arm is the fix, not decoration — see exclusion_sql"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_exclusion_composes_with_the_include_list_and_the_year_range():
+    """Three filters that must all apply at once. An exclusion that quietly replaced the
+    theme — or was appended after the year clause in a way that broke it — would look fine
+    in isolation and produce an off-theme game."""
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "want", "Wanted Rock", "Rock", 1995)
+        _insert_f(conn, "wrong_decade", "Old Rock", "Rock", 1965)
+        _insert_f(conn, "wrong_genre", "Nineties Pop", "Pop", 1995)
+        _insert_f(conn, "banned", "Nineties Adult Rock", "NotForKids", 1995)
+        _insert_f(conn, "untagged", "Nineties Untagged", None, 1995)
+        # Rock in the 90s, minus NotForKids: only 'want'. 'untagged' is NOT Rock, so the
+        # INCLUDE list drops it — inclusion is exact, exclusion spares NULLs, and the two
+        # are deliberately not symmetric.
+        assert game.pool_count(conn, ["easy"], ["Rock"], 1990, 1999, ["NotForKids"]) == 1
+        picked = game.pick_tracks(conn, 1, ["easy"], filters=game.filter_sql(
+            ["Rock"], 1990, 1999, ["NotForKids"]))
+        assert [t["id"] for t in picked] == ["want"]
+        # exclusion + decade with no include list: the untagged 90s track comes along
+        ids = {t["id"] for t in game.pick_tracks(conn, 3, ["easy"], filters=game.filter_sql(
+            None, 1990, 1999, ["NotForKids"]))}
+        assert ids == {"want", "wrong_genre", "untagged"}
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_genre_in_both_lists_is_excluded_rather_than_silently_forgiven():
+    """"Rock, but not Rock" has to resolve one way, in the open. The exclusion wins — a
+    veto beats a request — so the pool is empty and the preflight locks Start. Quietly
+    dropping the exclusion instead would play the one genre the host asked to leave out."""
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        for i in range(12):
+            _insert_f(conn, f"p{i}", f"Pop Act {i}", "Pop", 1995)
+        assert game.pool_count(conn, ["easy"], ["Rock"], None, None, ["Rock"]) == 0
+        assert game.pool_count(conn, ["easy"], ["Rock", "Pop"], None, None, ["Rock"]) == 12, \
+            "the other requested genre is untouched"
+        with pytest.raises(game.GameError, match="filters"):
+            game.Game(conn, rounds=10, tiers=["easy"], genres=["Rock"],
+                      exclude_genres=["Rock"], clock=Clock())
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_pool_preflight_sees_an_exclusion_that_empties_the_library():
+    """Excluding most of the library must lock Start with a count, not sail through the
+    preflight and fail at the moment of the tap. An exclusion the preflight ignored would
+    always report the full pool, which is the one number guaranteed to be wrong."""
+    conn, p = make_db(0)
+    try:
+        for i in range(20):
+            _insert_f(conn, f"p{i}", f"Pop Act {i}", "Pop", 1995)
+        for i in range(4):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        assert game.pool_count(conn, ["easy"]) == 24
+        assert game.pool_count(conn, ["easy"], None, None, None, ["Pop"]) == 4, \
+            "excluding the bulk of the library must show up as a small pool"
+        assert game.pool_count(conn, ["easy"], None, None, None, ["Pop", "Rock"]) == 0
+        with pytest.raises(game.GameError):
+            game.Game(conn, rounds=10, tiers=["easy"], exclude_genres=["Pop"], clock=Clock())
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_an_excluded_genre_never_appears_as_a_decoy_even_when_the_options_widen():
+    """The subtle one. pick_decoys deliberately abandons the theme when a narrow filter
+    can't fill four options — a modern decoy in a 60s round is a small giveaway, worth it
+    for a playable round. An excluded genre is not the same trade: decoys are read out loud
+    like every other option, so the widened query must keep the exclusion."""
+    conn, p = make_db(0)
+    try:
+        _insert_f(conn, "answer", "The Only Jazz Act", "Jazz", 1995)
+        for i in range(30):
+            _insert_f(conn, f"adult{i}", f"Adult Act {i}", "NotForKids", 1995)
+        for i in range(5):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        answer = dict(conn.execute("SELECT * FROM tracks WHERE id='answer'").fetchone())
+        # one Jazz track, so the themed decoy query can't fill three and MUST widen
+        filters = game.filter_sql(["Jazz"], exclude_genres=["NotForKids"])
+        exclusions = game.exclusion_sql(["NotForKids"])
+        for _ in range(30):
+            decoys = game.pick_decoys(conn, answer, filters=filters, exclusions=exclusions)
+            assert len(decoys) == 3, "the round still gets four options"
+            assert not any(d["artist"].startswith("Adult") for d in decoys), decoys
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_real_excluded_game_wires_the_exclusion_into_every_picker():
+    """Covers the WIRING rather than the fragment: Game has to thread the exclusion into
+    the track pool, the decoys AND the boost round. Testing filter_sql alone leaves every
+    one of those call sites free to drop it."""
+    conn, p = make_db(0)
+    try:
+        for i in range(14):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        for i in range(20):
+            _insert_f(conn, f"adult{i}", "Adult Act", "NotForKids", 1995)
+        g = game.Game(conn, rounds=10, tiers=["easy"], exclude_genres=["NotForKids"],
+                      clock=Clock())
+        g.join("Sam")
+        # a favourite artist who only exists in the excluded genre gets no boost round
+        g.set_artists("Sam", ["Adult Act"])
+        g.build_rounds(conn)
+        assert len(g.rounds) == 10
+        for rnd in g.rounds:
+            assert rnd["track"]["genre"] == "Pop", rnd["track"]
+            for o in rnd["options"]:
+                assert o["artist"] != "Adult Act", \
+                    f"an excluded track was read out as a decoy: {rnd['options']}"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_count_endpoint_carries_the_exclusion_from_the_picker(monkeypatch):
+    """The wire format, not the SQL: the picker sends exclude_genres as a pipe-separated
+    query param, and a server that ignored it would answer every exclusion with the full
+    pool — so Start would unlock on a combination that cannot fill a game."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    conn, p = make_db(0)
+    try:
+        for i in range(20):
+            _insert_f(conn, f"pop{i}", f"Pop Act {i}", "Pop", 1995)
+        for i in range(4):
+            _insert_f(conn, f"adult{i}", f"Adult Act {i}", "NotForKids", 1995)
+        _insert_f(conn, "untagged", "Untagged Band", None, 1995)
+        real_connect = db.connect
+        monkeypatch.setattr(main.db, "connect", lambda *a, **kw: real_connect(p))
+        c = TestClient(main.app)
+        assert c.get("/api/round-filters/count?tiers=easy").json()["tracks"] == 25
+        body = c.get("/api/round-filters/count?tiers=easy&exclude_genres=Pop").json()
+        assert body["tracks"] == 5, "the 4 excluded-genre tracks plus the untagged one"
+        assert body["enough_for_10"] is False, "Start must lock on a 5-song pool"
+        assert c.get("/api/round-filters/count?tiers=easy&exclude_genres=NotForKids"
+                     ).json()["tracks"] == 21, "untagged tracks survive the exclusion"
+        # two exclusions at once, pipe-separated like the include list
+        assert c.get("/api/round-filters/count?tiers=easy&exclude_genres=Pop|NotForKids"
+                     ).json()["tracks"] == 1
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_filter_label_says_what_was_left_out():
+    """An exclusion-only game plays the whole library bar a slice, so it is otherwise
+    indistinguishable from an unfiltered one — with the label silent nobody in the room can
+    tell whether the exclusion was applied at all."""
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        mk = lambda **kw: game.Game(conn, rounds=1, tiers=["easy"], clock=Clock(), **kw)
+        assert mk(exclude_genres=["NotForKids"]).filter_label() == "no NotForKids"
+        assert mk(genres=["Rock"], exclude_genres=["Blues"], year_from=1990, year_to=1999) \
+            .filter_label() == "Rock · no Blues · the 1990s"
+        assert mk(exclude_genres=["Blues", "Jazz"]).filter_label() == "no Blues · no Jazz"
+        assert mk(exclude_genres=["NotForKids"]).snapshot()["filter_label"] \
+            == "no NotForKids", "the board and every phone get it too"
+    finally:
+        conn.close(); os.unlink(p)
+
+
 # -- cross-game track history ----------------------------------------------
 
 def _played(conn, track_id, at):

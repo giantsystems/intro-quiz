@@ -213,20 +213,26 @@ def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
 
 @app.get("/api/round-filters/count")
 def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
-                            year_from: int | None = None, year_to: int | None = None):
+                            year_from: int | None = None, year_to: int | None = None,
+                            exclude_genres: str = ""):
     """How many tracks a specific combination leaves — the preflight for a real choice.
 
     Genres and decades are independently plausible and their INTERSECTION can still be
     empty ('Reggae' has 56 tracks and the 1960s has 208; the overlap may be zero). Without
     this the only feedback was GameError at the moment someone tapped Start.
+
+    exclude_genres is pipe-separated like genres. It counts here as well as at start, so
+    "everything except this one tag" gets the same locked-Start treatment as any other
+    choice — an exclusion wide enough to empty the pool must be caught before the tap.
     """
     tl = [t.strip() for t in tiers.split(",") if t.strip()]
     gl = [g for g in (genres.split("|") if genres else []) if g]
+    xl = [g for g in (exclude_genres.split("|") if exclude_genres else []) if g]
     if not tl:
         return Response(status_code=400, content="tiers must not be empty")
     conn = db.connect()
     try:
-        n = game.pool_count(conn, tl, gl, year_from, year_to)
+        n = game.pool_count(conn, tl, gl, year_from, year_to, xl)
         return {"tracks": n, "enough_for_10": n >= 10}
     finally:
         conn.close()
@@ -848,6 +854,7 @@ async def on_new_game(s: WSSession, msg: dict) -> None:
             tiers=msg.get("tiers") or ["easy", "medium"],
             # round filters — absent/empty means the whole library
             genres=msg.get("genres") or None,
+            exclude_genres=msg.get("exclude_genres") or None,
             year_from=msg.get("year_from"), year_to=msg.get("year_to"))
         trivia.ensure_seeded(conn)
     finally:

@@ -77,8 +77,35 @@ def display_name(name: str) -> str:
 YEAR_MIN, YEAR_MAX = 1900, 2030
 
 
+def exclusion_sql(exclude_genres: list[str] | None = None) -> tuple[str, list]:
+    """The "everything EXCEPT these" half of the round filter, on its own.
+
+    Separate from filter_sql because it outlives the theme: pick_decoys widens to the
+    unfiltered pool when a narrow theme can't fill four options, and the widening may drop
+    the theme but must never drop the exclusion.
+
+    Not replaceable by "tick the other nineteen genres". The picker only offers genres
+    holding at least min_tracks, so a few hundred quizzable tracks carry a tag no checkbox
+    ever shows — ticking everything on offer quietly loses them, and excluding by name
+    doesn't.
+
+    The `genre IS NULL` arm is LOAD-BEARING; it is not defensive noise. SQL's three-valued
+    logic makes `NULL NOT IN ('X')` evaluate to NULL rather than true, so a bare NOT IN
+    silently drops every untagged track. Checked against SQLite over the rows
+    ['Pop', 'X', NULL, 'Obscure']: `genre NOT IN ('X')` returns Pop and Obscure and loses
+    the NULL row; the form below returns Pop, NULL and Obscure. The chosen semantics are
+    "exclude only what I named", and an untagged track was not named. Do not simplify this
+    back to a bare NOT IN.
+    """
+    if not exclude_genres:
+        return "", []
+    qmarks = ",".join("?" * len(exclude_genres))
+    return f" AND (genre IS NULL OR genre NOT IN ({qmarks}))", list(exclude_genres)
+
+
 def filter_sql(genres: list[str] | None = None, year_from: int | None = None,
-               year_to: int | None = None) -> tuple[str, list]:
+               year_to: int | None = None,
+               exclude_genres: list[str] | None = None) -> tuple[str, list]:
     """Build the round-filter SQL fragment and its params: genres and/or a year range.
 
     Deliberately SEPARATE from QUIZZABLE rather than folded into it. QUIZZABLE describes
@@ -94,11 +121,22 @@ def filter_sql(genres: list[str] | None = None, year_from: int | None = None,
 
     A year filter also excludes tracks whose year is missing or junk (493 quizzable tracks
     have no year at all). You cannot honestly claim an untagged track belongs to the 90s.
+
+    exclude_genres is the mirror image and is NOT symmetric with the include list — see
+    exclusion_sql for why an untagged track survives an exclusion but not an inclusion.
+    A genre named in BOTH lists is EXCLUDED: the two fragments are ANDed, so a veto always
+    beats a request. That falls out of the SQL rather than being special-cased, which is the
+    point — there is no branch here that could drift from it. "Rock, but not Rock" then
+    counts zero tracks and the preflight locks Start, which is honest; the alternative
+    (quietly dropping the exclusion) would ignore something the host explicitly asked for.
     """
     frag, params = "", []
     if genres:
         frag += f" AND genre IN ({','.join('?' * len(genres))})"
         params += list(genres)
+    xfrag, xparams = exclusion_sql(exclude_genres)
+    frag += xfrag
+    params += xparams
     if year_from is not None or year_to is not None:
         lo = max(int(year_from), YEAR_MIN) if year_from is not None else YEAR_MIN
         hi = min(int(year_to), YEAR_MAX) if year_to is not None else YEAR_MAX
@@ -108,7 +146,8 @@ def filter_sql(genres: list[str] | None = None, year_from: int | None = None,
 
 
 def pool_count(conn, tiers: list[str], genres: list[str] | None = None,
-               year_from: int | None = None, year_to: int | None = None) -> int:
+               year_from: int | None = None, year_to: int | None = None,
+               exclude_genres: list[str] | None = None) -> int:
     """How many tracks a game with these filters could draw on.
 
     Exists so the UI can warn BEFORE the game starts. Without it the only feedback was
@@ -116,7 +155,7 @@ def pool_count(conn, tiers: list[str], genres: list[str] | None = None,
     'Reggae + 1960s' is 56 and 208 tracks respectively and their intersection may be zero,
     which is a fine thing to want and a terrible way to find out.
     """
-    frag, fparams = filter_sql(genres, year_from, year_to)
+    frag, fparams = filter_sql(genres, year_from, year_to, exclude_genres)
     qmarks = ",".join("?" * len(tiers))
     return conn.execute(
         f"SELECT COUNT(*) c FROM tracks WHERE {QUIZZABLE} AND tier IN ({qmarks}){frag}",
@@ -201,7 +240,8 @@ def pick_artist_track(conn, artists: list[str], exclude: set,
 
 
 def pick_decoys(conn, track: dict, n: int = 3,
-                filters: tuple[str, list] | None = None) -> list[dict]:
+                filters: tuple[str, list] | None = None,
+                exclusions: tuple[str, list] | None = None) -> list[dict]:
     """Plausible wrong answers: same tier, different artist, prefer same decade.
 
     The SQL exclusion is a literal string compare, which a variant spelling of
@@ -217,9 +257,15 @@ def pick_decoys(conn, track: dict, n: int = 3,
     for a genre round. The filtered query is tried FIRST and falls back to the unfiltered
     one, because four options beat a failed round — a narrow filter might not hold enough
     distinct artists to fill the decoys.
+
+    An EXCLUDED genre is not part of that trade. Widening is allowed to give up the theme
+    (a modern decoy in a 60s round is only a bit of a giveaway) but never the exclusion: an
+    excluded genre is "don't put this in front of the room tonight", and a decoy is read out
+    loud like every other option. So `exclusions` is applied to the widened query too.
     """
     decade = (track["year"] or 0) // 10
     ffrag, fparams = filters or ("", [])
+    xfrag, xparams = exclusions or ("", [])
     base = ("SELECT DISTINCT title, artist, year FROM tracks WHERE active=1 "
             "AND tier IS NOT NULL AND artist != ? AND title != ?")
     rows = []
@@ -229,8 +275,8 @@ def pick_decoys(conn, track: dict, n: int = 3,
     # too few DISTINCT ARTISTS in the filtered pool to fill the options — widen rather
     # than fail, since a round with two choices is worse than one with modern decoys
     if len({library.artist_key(r["artist"]) for r in rows}) <= n:
-        rows = conn.execute(f"{base} ORDER BY RANDOM() LIMIT 60",
-                            (track["artist"], track["title"])).fetchall()
+        rows = conn.execute(f"{base}{xfrag} ORDER BY RANDOM() LIMIT 60",
+                            (track["artist"], track["title"], *xparams)).fetchall()
     same_decade = [r for r in rows if (r["year"] or 0) // 10 == decade]
     picked: list[dict] = []
     answer_title = (track["title"] or "").strip().lower()
@@ -253,7 +299,8 @@ def pick_decoys(conn, track: dict, n: int = 3,
 class Game:
     def __init__(self, conn, rounds: int = 10, tiers: list[str] | None = None,
                  clock=time.monotonic, genres: list[str] | None = None,
-                 year_from: int | None = None, year_to: int | None = None):
+                 year_from: int | None = None, year_to: int | None = None,
+                 exclude_genres: list[str] | None = None):
         self.tiers = tiers or ["easy", "medium"]
         self.n_rounds = rounds
         self.clock = clock
@@ -261,8 +308,12 @@ class Game:
         # exactly the same one. Kept for the snapshot too, so the phones and the board can
         # say what kind of game this is ("Rock · the 90s") rather than looking identical.
         self.genres = list(genres) if genres else []
+        self.exclude_genres = list(exclude_genres) if exclude_genres else []
         self.year_from, self.year_to = year_from, year_to
-        self.filters = filter_sql(self.genres, year_from, year_to)
+        self.filters = filter_sql(self.genres, year_from, year_to, self.exclude_genres)
+        # Held separately as well, because pick_decoys is allowed to abandon self.filters to
+        # fill four options and must still honour the exclusion when it does.
+        self.exclusions = exclusion_sql(self.exclude_genres)
         self.rounds: list[dict] = []  # built lazily at first start_round, after artist picks
         # fail fast if the pool can't even fill a plain game
         pick_tracks(conn, rounds, self.tiers, filters=self.filters)
@@ -296,7 +347,7 @@ class Game:
         return [n for n, p in self.players.items() if not p.get("ready")]
 
     def _mk_round(self, conn, t: dict) -> dict:
-        options = (pick_decoys(conn, t, filters=self.filters)
+        options = (pick_decoys(conn, t, filters=self.filters, exclusions=self.exclusions)
                    + [{"title": t["title"], "artist": t["artist"]}])
         random.shuffle(options)
         return {
@@ -629,8 +680,14 @@ class Game:
         Worth showing everywhere: a filtered game looks identical to a normal one, and a
         player who doesn't know the round is 60s-only reads their four modern-looking
         options as a bug.
+
+        An exclusion is stated too ("no NotForKids"), not left implicit. It's the case most
+        worth saying out loud: an exclusion-only game shows the WHOLE library minus a slice,
+        so with the label silent the game is indistinguishable from an unfiltered one and
+        nobody in the room can tell whether the exclusion was actually applied.
         """
         bits = list(self.genres)
+        bits += [f"no {g}" for g in self.exclude_genres]
         lo, hi = self.year_from, self.year_to
         if lo is not None and hi is not None:
             # a single decade reads far better as "the 1990s" than "1990–1999"

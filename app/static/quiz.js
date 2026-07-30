@@ -431,6 +431,7 @@ function renderDisplays() {
 // state, so it doesn't belong in the websocket snapshot every tick.
 let filterOpts = null;          // {genres:[{genre,tracks}], decades:[{decade,tracks}]}
 let pickedGenres = new Set();
+let bannedGenres = new Set();   // "everything EXCEPT these" — see toggleBannedGenre
 let pickedDecade = null;        // the decade's first year, e.g. 1990
 let countKey = "";              // dedupes the count fetch across repeated renders
 
@@ -445,6 +446,22 @@ function loadFilterOpts() {
 
 function toggleGenre(g) {
   if (pickedGenres.has(g)) pickedGenres.delete(g); else pickedGenres.add(g);
+  bannedGenres.delete(g);   // see toggleBannedGenre: the two lists never overlap here
+  render();
+}
+
+// "Everything except this", which is NOT the same as ticking the other nineteen: the picker
+// only lists genres above min_tracks, so a few hundred quizzable tracks carry a tag no
+// checkbox here ever shows. Ticking round them loses those tracks; excluding by name keeps
+// them, untagged ones included.
+//
+// The two sets are kept disjoint rather than allowed to contradict each other. The server
+// resolves "Rock and not Rock" to zero tracks (the exclusion is a veto and wins), which is
+// honest but a baffling thing to be shown by your own two taps — so the second tap moves
+// the genre instead of stacking a contradiction.
+function toggleBannedGenre(g) {
+  if (bannedGenres.has(g)) bannedGenres.delete(g); else bannedGenres.add(g);
+  pickedGenres.delete(g);
   render();
 }
 
@@ -455,9 +472,12 @@ function toggleDecade(d) {
 
 function renderFilters() {
   const gbox = document.getElementById("genre-choice");
+  const xbox = document.getElementById("exclude-choice");
   const dbox = document.getElementById("decade-choice");
   const out = document.getElementById("filter-count");
-  if (state.phase !== "idle") { gbox.innerHTML = ""; dbox.innerHTML = ""; out.textContent = ""; return; }
+  if (state.phase !== "idle") {
+    gbox.innerHTML = ""; xbox.innerHTML = ""; dbox.innerHTML = ""; out.textContent = ""; return;
+  }
   loadFilterOpts();
   gbox.innerHTML = "";
   for (const g of (filterOpts ? filterOpts.genres : []).slice(0, 12)) {
@@ -465,6 +485,16 @@ function renderFilters() {
     b.textContent = (pickedGenres.has(g.genre) ? "✅ " : "") + g.genre + " (" + g.tracks + ")";
     b.onclick = () => toggleGenre(g.genre);
     gbox.appendChild(b);
+  }
+  // Not sliced to 12 like the include list above. The genre worth leaving out is usually a
+  // small tag, so it sits at the bottom of a count-ordered list — cutting the list short is
+  // exactly how the one genre this feature exists for becomes unreachable. The wall scrolls.
+  xbox.innerHTML = "";
+  for (const g of (filterOpts ? filterOpts.genres : [])) {
+    const b = document.createElement("button");
+    b.textContent = (bannedGenres.has(g.genre) ? "🚫 " : "") + g.genre;
+    b.onclick = () => toggleBannedGenre(g.genre);
+    xbox.appendChild(b);
   }
   dbox.innerHTML = "";
   for (const d of (filterOpts ? filterOpts.decades : [])) {
@@ -478,13 +508,15 @@ function renderFilters() {
   // totals — and the Start button locks when it can't fill a game, instead of letting the
   // server refuse at the moment of the tap.
   const start = document.getElementById("start-game");
-  const key = [...pickedGenres].sort().join("|") + "/" + pickedDecade;
-  if (!pickedGenres.size && pickedDecade === null) {
+  const key = [...pickedGenres].sort().join("|") + "/" + pickedDecade
+            + "/!" + [...bannedGenres].sort().join("|");
+  if (!pickedGenres.size && !bannedGenres.size && pickedDecade === null) {
     out.textContent = ""; start.disabled = false; countKey = ""; return;
   }
   if (key === countKey) return;   // same choice, already counted — don't refetch per render
   countKey = key;
   const qs = "genres=" + encodeURIComponent([...pickedGenres].join("|"))
+           + "&exclude_genres=" + encodeURIComponent([...bannedGenres].join("|"))
            + (pickedDecade === null ? "" : "&year_from=" + pickedDecade + "&year_to=" + (pickedDecade + 9));
   fetch("/api/round-filters/count?" + qs).then(r => r.json()).then(d => {
     if (key !== countKey) return;   // a newer choice landed first
@@ -498,6 +530,7 @@ function renderFilters() {
 function startGame() {
   const msg = {type: "new_game", rounds: 10};
   if (pickedGenres.size) msg.genres = [...pickedGenres];
+  if (bannedGenres.size) msg.exclude_genres = [...bannedGenres];
   if (pickedDecade !== null) { msg.year_from = pickedDecade; msg.year_to = pickedDecade + 9; }
   send(msg);
 }
