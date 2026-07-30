@@ -13,7 +13,7 @@ v1.33.0 is tagged, released, and running in production. It shipped five improvem
 genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
-- **Tests:** 249 python + two node smokes (`make test`, `make test-js`). All green.
+- **Tests:** 259 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
 - **Library:** 23,083 tracks synced, 22,888 tiered
   (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
@@ -92,7 +92,7 @@ Two decisions worth knowing about, both deliberate:
   `adoptSeatedName` ([quiz.js:97](../app/static/quiz.js#L97)) takes the server's spelling
   so the "is this me?" comparisons in `render()` keep working.
 
-**Tests:** 9 new (236 python total). Each was verified by reverting the fix and watching
+**Tests:** 9 new. Each was verified by reverting the fix and watching
 it fail — including the two subtle ones: `COLLATE NOCASE` *without* `display_name` still
 passes a naive one-row assertion, and folding only in `join` passes everything except a
 full game played under mixed spellings. The board needed no change; it renders snapshot
