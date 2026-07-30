@@ -218,7 +218,13 @@ subscriptions.
   step to get told when new tracks look mis-tagged (see Notes). Clips cost ~2 MB per track.
 - **Server control page** — `/admin` runs any of those maintenance actions from
   the browser instead: one job at a time, live progress while it runs, the run's
-  log output, and each action's last outcome. It also shows the running game
+  log output, and each action's last outcome. The running job's button becomes
+  **Abort** — a multi-hour clip sweep or bootstrap no longer blocks the one job you
+  actually want. Stopping is cooperative (it lands at the next clip, lookup or stage,
+  never mid-write) and loses nothing: every job resumes where it left off, so the card
+  says *stopped — run again to resume*. A start refused because something else holds
+  the slot is an honest **HTTP 409**, not a `200` with `started: false` buried in the
+  body. It also shows the running game
   (players, scores, round — never the current song, so a playing admin can't
   cheat) with **abandon game** and **change game master** controls, and picks the
   speaker the music plays on (**Speakers tab**, above). Set
