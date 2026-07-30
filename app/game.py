@@ -52,6 +52,58 @@ class GameError(RuntimeError):
     pass
 
 
+# A year this far outside living memory is a broken tag, not a release date. Real junk in
+# this library: AFI's 'Miss Murder' is tagged 1212. Left alone it would be a "1210s" entry
+# in the decade picker, and a track that no decade filter could ever legitimately match.
+YEAR_MIN, YEAR_MAX = 1900, 2030
+
+
+def filter_sql(genres: list[str] | None = None, year_from: int | None = None,
+               year_to: int | None = None) -> tuple[str, list]:
+    """Build the round-filter SQL fragment and its params: genres and/or a year range.
+
+    Deliberately SEPARATE from QUIZZABLE rather than folded into it. QUIZZABLE describes
+    what is permanently playable and is read by /health and the artist wall (main.py), which
+    must keep measuring the WHOLE library — a "60s only" game must not make /health report
+    the library as nearly empty, or the artist wall shrink to the artists of one decade.
+
+    Genres match EXACTLY. The tags are freeform (70 distinct over the quizzable pool, with
+    'Rock', 'Hard Rock', 'Alternative Rock' and 'Rock & Roll' all separate), so a substring
+    match on 'Rock' would silently pull in four genres the user didn't tick. Exact matching
+    is predictable, and the picker UI is built from the real values with counts, so nobody
+    has to guess what exists.
+
+    A year filter also excludes tracks whose year is missing or junk (493 quizzable tracks
+    have no year at all). You cannot honestly claim an untagged track belongs to the 90s.
+    """
+    frag, params = "", []
+    if genres:
+        frag += f" AND genre IN ({','.join('?' * len(genres))})"
+        params += list(genres)
+    if year_from is not None or year_to is not None:
+        lo = max(int(year_from), YEAR_MIN) if year_from is not None else YEAR_MIN
+        hi = min(int(year_to), YEAR_MAX) if year_to is not None else YEAR_MAX
+        frag += " AND year IS NOT NULL AND year BETWEEN ? AND ?"
+        params += [lo, hi]
+    return frag, params
+
+
+def pool_count(conn, tiers: list[str], genres: list[str] | None = None,
+               year_from: int | None = None, year_to: int | None = None) -> int:
+    """How many tracks a game with these filters could draw on.
+
+    Exists so the UI can warn BEFORE the game starts. Without it the only feedback was
+    Game.__init__ raising GameError at the moment someone tapped "Start a new game" —
+    'Reggae + 1960s' is 56 and 208 tracks respectively and their intersection may be zero,
+    which is a fine thing to want and a terrible way to find out.
+    """
+    frag, fparams = filter_sql(genres, year_from, year_to)
+    qmarks = ",".join("?" * len(tiers))
+    return conn.execute(
+        f"SELECT COUNT(*) c FROM tracks WHERE {QUIZZABLE} AND tier IN ({qmarks}){frag}",
+        (*tiers, *fparams)).fetchone()["c"]
+
+
 def recent_track_ids(conn, limit: int = RECENT_MEMORY) -> list[str]:
     """The most recently ASKED track ids, newest first — see the `plays` table.
 
@@ -79,22 +131,27 @@ def _freshest(rows: list, recent: list[str], n: int) -> list:
     return sorted(rows, key=lambda r: -rank.get(r["id"], fresh_rank))[:n]
 
 
-def pick_tracks(conn, rounds: int, tiers: list[str], exclude: set | None = None) -> list[dict]:
+def pick_tracks(conn, rounds: int, tiers: list[str], exclude: set | None = None,
+                filters: tuple[str, list] | None = None) -> list[dict]:
     qmarks = ",".join("?" * len(tiers))
     ex = exclude or set()
     exq = f"AND id NOT IN ({','.join('?' * len(ex))}) " if ex else ""
+    ffrag, fparams = filters or ("", [])
     # Deliberately NOT "LIMIT rounds": the freshness sort needs candidates to choose
     # BETWEEN. Limiting in SQL would hand back 10 random rows and leave nothing to prefer,
     # so the whole history would have no effect. Capped so a huge library stays cheap.
     rows = conn.execute(
-        f"SELECT * FROM tracks WHERE {QUIZZABLE} AND tier IN ({qmarks}) {exq}"
-        f"ORDER BY RANDOM() LIMIT ?", (*tiers, *ex, max(rounds * 20, 200))).fetchall()
+        f"SELECT * FROM tracks WHERE {QUIZZABLE} AND tier IN ({qmarks}) {exq}{ffrag} "
+        f"ORDER BY RANDOM() LIMIT ?",
+        (*tiers, *ex, *fparams, max(rounds * 20, 200))).fetchall()
     if len(rows) < rounds:
-        raise GameError(f"only {len(rows)} clipped tracks in tiers {tiers} — need {rounds}")
+        what = f"tiers {tiers}" + (" with the chosen filters" if ffrag else "")
+        raise GameError(f"only {len(rows)} clipped tracks in {what} — need {rounds}")
     return [dict(r) for r in _freshest(rows, recent_track_ids(conn), rounds)]
 
 
-def pick_artist_track(conn, artists: list[str], exclude: set) -> dict | None:
+def pick_artist_track(conn, artists: list[str], exclude: set,
+                      filters: tuple[str, list] | None = None) -> dict | None:
     """One quizzable track by any of the player's chosen artists (any tier).
 
     Matched on library.artist_key rather than the literal tag: picking 'AC/DC'
@@ -108,10 +165,15 @@ def pick_artist_track(conn, artists: list[str], exclude: set) -> dict | None:
     wanted = {library.artist_key(a) for a in artists}
     ex = exclude or set()
     exq = f"AND id NOT IN ({','.join('?' * len(ex))}) " if ex else ""
+    ffrag, fparams = filters or ("", [])
     rows = conn.execute(
-        f"SELECT * FROM tracks WHERE {QUIZZABLE} {exq}ORDER BY RANDOM()", tuple(ex)).fetchall()
+        f"SELECT * FROM tracks WHERE {QUIZZABLE} {exq}{ffrag} ORDER BY RANDOM()",
+        (*ex, *fparams)).fetchall()
     matches = [r for r in rows if library.artist_key(r["artist"]) in wanted]
     if not matches:
+        # A boost round is a bonus, not a promise. With filters on, a player's favourite
+        # artists may have nothing in the chosen genre or decade — that's a normal outcome,
+        # and build_rounds just fills the slot from the pool instead.
         return None
     # Same freshness preference as the main pool. It matters MORE here: a player picks the
     # same three favourite artists most weeks, so without this their boost round is drawn
@@ -119,7 +181,8 @@ def pick_artist_track(conn, artists: list[str], exclude: set) -> dict | None:
     return dict(_freshest(matches, recent_track_ids(conn), 1)[0])
 
 
-def pick_decoys(conn, track: dict, n: int = 3) -> list[dict]:
+def pick_decoys(conn, track: dict, n: int = 3,
+                filters: tuple[str, list] | None = None) -> list[dict]:
     """Plausible wrong answers: same tier, different artist, prefer same decade.
 
     The SQL exclusion is a literal string compare, which a variant spelling of
@@ -128,12 +191,27 @@ def pick_decoys(conn, track: dict, n: int = 3) -> list[dict]:
     the same with only one scored right. So the artist filtering below is done on
     library.artist_key, not on the raw tag, and a decoy whose title matches the
     answer's is dropped outright (11 songs in this library sit on two spellings).
+
+    Decoys obey the round filters too, and that is a fairness fix rather than tidiness:
+    in a 60s-only game, three decoys drawn from the whole library would be recognisably
+    modern, so the answer is the one old-sounding option and the question is free. Same
+    for a genre round. The filtered query is tried FIRST and falls back to the unfiltered
+    one, because four options beat a failed round — a narrow filter might not hold enough
+    distinct artists to fill the decoys.
     """
     decade = (track["year"] or 0) // 10
-    rows = conn.execute(
-        "SELECT DISTINCT title, artist, year FROM tracks WHERE active=1 AND tier IS NOT NULL "
-        "AND artist != ? AND title != ? ORDER BY RANDOM() LIMIT 60",
-        (track["artist"], track["title"])).fetchall()
+    ffrag, fparams = filters or ("", [])
+    base = ("SELECT DISTINCT title, artist, year FROM tracks WHERE active=1 "
+            "AND tier IS NOT NULL AND artist != ? AND title != ?")
+    rows = []
+    if ffrag:
+        rows = conn.execute(f"{base}{ffrag} ORDER BY RANDOM() LIMIT 60",
+                            (track["artist"], track["title"], *fparams)).fetchall()
+    # too few DISTINCT ARTISTS in the filtered pool to fill the options — widen rather
+    # than fail, since a round with two choices is worse than one with modern decoys
+    if len({library.artist_key(r["artist"]) for r in rows}) <= n:
+        rows = conn.execute(f"{base} ORDER BY RANDOM() LIMIT 60",
+                            (track["artist"], track["title"])).fetchall()
     same_decade = [r for r in rows if (r["year"] or 0) // 10 == decade]
     picked: list[dict] = []
     answer_title = (track["title"] or "").strip().lower()
@@ -155,13 +233,20 @@ def pick_decoys(conn, track: dict, n: int = 3) -> list[dict]:
 
 class Game:
     def __init__(self, conn, rounds: int = 10, tiers: list[str] | None = None,
-                 clock=time.monotonic):
+                 clock=time.monotonic, genres: list[str] | None = None,
+                 year_from: int | None = None, year_to: int | None = None):
         self.tiers = tiers or ["easy", "medium"]
         self.n_rounds = rounds
         self.clock = clock
+        # Round filters, held as the built fragment so every picker in this game applies
+        # exactly the same one. Kept for the snapshot too, so the phones and the board can
+        # say what kind of game this is ("Rock · the 90s") rather than looking identical.
+        self.genres = list(genres) if genres else []
+        self.year_from, self.year_to = year_from, year_to
+        self.filters = filter_sql(self.genres, year_from, year_to)
         self.rounds: list[dict] = []  # built lazily at first start_round, after artist picks
         # fail fast if the pool can't even fill a plain game
-        pick_tracks(conn, rounds, self.tiers)
+        pick_tracks(conn, rounds, self.tiers, filters=self.filters)
         self.players: dict[str, dict] = {}  # name -> {score, correct, fastest_ms, artists}
         self.current = -1
         self.host: str | None = None  # the player who started the game — runs the rounds
@@ -190,7 +275,8 @@ class Game:
         return [n for n, p in self.players.items() if not p.get("ready")]
 
     def _mk_round(self, conn, t: dict) -> dict:
-        options = pick_decoys(conn, t) + [{"title": t["title"], "artist": t["artist"]}]
+        options = (pick_decoys(conn, t, filters=self.filters)
+                   + [{"title": t["title"], "artist": t["artist"]}])
         random.shuffle(options)
         return {
             "track": t,
@@ -213,11 +299,12 @@ class Game:
         for p in self.players.values():
             if len(picked) >= self.n_rounds - 1:
                 break  # keep at least one neutral round
-            t = pick_artist_track(conn, p.get("artists") or [], ids)
+            t = pick_artist_track(conn, p.get("artists") or [], ids, filters=self.filters)
             if t:
                 picked.append(t)
                 ids.add(t["id"])
-        picked += pick_tracks(conn, self.n_rounds - len(picked), self.tiers, exclude=ids)
+        picked += pick_tracks(conn, self.n_rounds - len(picked), self.tiers, exclude=ids,
+                              filters=self.filters)
         random.shuffle(picked)  # boost rounds indistinguishable
         self.rounds = [self._mk_round(conn, t) for t in picked]
 
@@ -483,6 +570,24 @@ class Game:
         return game_id
 
     # -- snapshots -----------------------------------------------------------
+    def filter_label(self) -> str:
+        """"Rock · Pop · the 1990s" — what kind of game this is, or "" for the whole library.
+
+        Worth showing everywhere: a filtered game looks identical to a normal one, and a
+        player who doesn't know the round is 60s-only reads their four modern-looking
+        options as a bug.
+        """
+        bits = list(self.genres)
+        lo, hi = self.year_from, self.year_to
+        if lo is not None and hi is not None:
+            # a single decade reads far better as "the 1990s" than "1990–1999"
+            bits.append(f"the {lo}s" if hi == lo + 9 and lo % 10 == 0 else f"{lo}–{hi}")
+        elif lo is not None:
+            bits.append(f"{lo} onwards")
+        elif hi is not None:
+            bits.append(f"up to {hi}")
+        return " · ".join(bits)
+
     def snapshot(self) -> dict:
         """State for clients. The correct answer only ships during reveal/finished."""
         s = {
@@ -495,6 +600,9 @@ class Game:
                          "ready": bool(p.get("ready")), "remote": bool(p.get("remote"))}
                         for n, p in sorted(self.players.items(), key=lambda kv: -kv[1]["score"])],
         }
+        if label := self.filter_label():
+            # only present on a filtered game, so unfiltered UIs render exactly as before
+            s["filter_label"] = label
         if self.current >= 0 and self.phase in ("question", "reveal"):
             rnd = self.rounds[self.current]
             s["options"] = [f'{o["title"]} — {o["artist"]}' for o in rnd["options"]]

@@ -104,6 +104,33 @@ finishes. Notes:
   plays on the single target rather than refusing to start.
 - One ticked speaker means no grouping — it's just the play target.
 
+## Themed games (genre and decade)
+
+The "start a new game" screen offers the genres and decades that actually hold enough
+quizzable tracks. Tap any number of genres and at most one decade; a live count sits under
+the pickers and **Start stays locked until the combination can fill a 10-round game**.
+Nothing to configure.
+
+Worth knowing:
+
+- The lists are built from the **quizzable** pool for the default tiers — a genre showing
+  56 is 56 tracks the quiz can really ask about, not 56 rows in the library. Anything under
+  25 tracks is left out entirely; with ~70 distinct genre tags most holding a handful of
+  tracks, showing them all would be a wall of dead options. Override with
+  `GET /api/round-filters?min_tracks=10` if you want a longer list.
+- Genres match the tag **exactly**. `Rock`, `Hard Rock`, `Alternative Rock` and
+  `Rock & Roll` are four separate options, because that's how the library is tagged — tick
+  several to widen.
+- Picking a decade also drops tracks with a **missing or junk year** (a few hundred have no
+  year at all, and one is tagged 1212), so a decade game is slightly smaller than the genre
+  count suggests. This is why the combined count is fetched rather than multiplied out.
+- The theme applies to **this game only**. `/health`, the artist wall and the tier counts
+  still describe the whole library.
+- A player's boost round stays **on theme too**, so a 1990s game has no stray 2015 track. If
+  none of their chosen artists has anything in the slice, they get an ordinary pool round
+  instead — a boost is a bonus, not a promise, and a themed game shouldn't refuse to start
+  because one person's favourites don't fit.
+
 ## All-time top scores
 
 Every finished game writes each player's score to the database, and the totals show up in

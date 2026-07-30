@@ -156,6 +156,64 @@ def api_stats():
         conn.close()
 
 
+@app.get("/api/round-filters")
+def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
+    """What a game can be narrowed to: genres and decades that hold enough tracks.
+
+    Feeds the "Start a new game" screen so a choice can't be made that then fails. The
+    counts are the honest quizzable pool for the DEFAULT tiers, so a genre showing 56 is 56
+    tracks the quiz can really ask about — not 56 rows in the library.
+
+    Anything under min_tracks is left out entirely rather than shown greyed: with 70 distinct
+    genres over the pool, most of them holding a handful of tracks, a full list would be a
+    wall of dead options. 25 is enough to build a 10-round game without the freshness
+    preference immediately handing back repeats.
+    """
+    tl = [t.strip() for t in tiers.split(",") if t.strip()]
+    if not tl:
+        return Response(status_code=400, content="tiers must not be empty")
+    conn = db.connect()
+    try:
+        qmarks = ",".join("?" * len(tl))
+        genres = [{"genre": r["genre"], "tracks": r["c"]} for r in conn.execute(
+            f"SELECT genre, COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} "
+            f"AND tier IN ({qmarks}) AND genre IS NOT NULL AND genre<>'' "
+            "GROUP BY genre HAVING c>=? ORDER BY c DESC", (*tl, min_tracks))]
+        # Decades come from the same pool. The year guard is game.YEAR_MIN/MAX rather than a
+        # bare "not null" because the tags carry real junk — a track dated 1212 would
+        # otherwise offer a "1210s" decade nobody can pick meaningfully.
+        decades = [{"decade": r["d"], "tracks": r["c"]} for r in conn.execute(
+            f"SELECT (year/10)*10 d, COUNT(*) c FROM tracks WHERE {game.QUIZZABLE} "
+            f"AND tier IN ({qmarks}) AND year BETWEEN ? AND ? "
+            "GROUP BY d HAVING c>=? ORDER BY d DESC",
+            (*tl, game.YEAR_MIN, game.YEAR_MAX, min_tracks))]
+        return {"tiers": tl, "min_tracks": min_tracks,
+                "total": game.pool_count(conn, tl), "genres": genres, "decades": decades}
+    finally:
+        conn.close()
+
+
+@app.get("/api/round-filters/count")
+def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
+                            year_from: int | None = None, year_to: int | None = None):
+    """How many tracks a specific combination leaves — the preflight for a real choice.
+
+    Genres and decades are independently plausible and their INTERSECTION can still be
+    empty ('Reggae' has 56 tracks and the 1960s has 208; the overlap may be zero). Without
+    this the only feedback was GameError at the moment someone tapped Start.
+    """
+    tl = [t.strip() for t in tiers.split(",") if t.strip()]
+    gl = [g for g in (genres.split("|") if genres else []) if g]
+    if not tl:
+        return Response(status_code=400, content="tiers must not be empty")
+    conn = db.connect()
+    try:
+        n = game.pool_count(conn, tl, gl, year_from, year_to)
+        return {"tracks": n, "enough_for_10": n >= 10}
+    finally:
+        conn.close()
+
+
 class AnnotationRow(BaseModel):
     id: str
     play_count: int = 0
@@ -622,8 +680,12 @@ async def ws_endpoint(ws: WebSocket):
                             raise game.GameError("house is Sleeping — start from the board to override")
                         conn = db.connect()
                         try:
-                            hub.game = game.Game(conn, rounds=int(msg.get("rounds", 10)),
-                                                 tiers=msg.get("tiers") or ["easy", "medium"])
+                            hub.game = game.Game(
+                                conn, rounds=int(msg.get("rounds", 10)),
+                                tiers=msg.get("tiers") or ["easy", "medium"],
+                                # round filters — absent/empty means the whole library
+                                genres=msg.get("genres") or None,
+                                year_from=msg.get("year_from"), year_to=msg.get("year_to"))
                             trivia.ensure_seeded(conn)
                         finally:
                             conn.close()

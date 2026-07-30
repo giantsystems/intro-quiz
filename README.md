@@ -156,6 +156,15 @@ subscriptions.
   A player's boost round gets the same treatment, which matters more — the same three
   favourite artists every week would otherwise land on the same song. Rounds from an
   **abandoned** game count too: they were still asked out loud.
+- **Themed rounds** — before starting, pick one or more **genres** and/or a **decade**
+  ("Rock · the 1990s"), and the whole game is drawn from that slice. Only choices with
+  enough tracks behind them are offered, and the *combination* is counted live before
+  Start unlocks — genres and decades are each plausible while their overlap is empty, and
+  the old failure mode was an error at the moment someone tapped Start. The decoys obey
+  the theme as well: three modern wrong answers next to a 60s right one gives the game
+  away, so a themed round widens its decoy search rather than breaking the illusion.
+  The filter narrows *this game only* — `/health` and the artist wall still measure the
+  whole library. The theme shows on the board and on every phone.
 - **The TV board** — a second web page cast to the display via DashCast
   (pychromecast). The board **plays the round audio itself** through the Web Audio API
   (one audio context for the whole game) — casting clips as media would evict the

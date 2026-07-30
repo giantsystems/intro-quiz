@@ -31,7 +31,14 @@ function mkEl(id) {
            // createElement + appendChild (the scoreboards, the rosters, the
            // all-time table) are actually inspectable. A no-op appendChild made
            // every such assertion vacuously pass against an empty string.
-           appendChild(c) { this.innerHTML += c && c.innerHTML ? c.innerHTML : ""; },
+           //
+           // textContent counts as content too. Buttons built with b.textContent = ...
+           // (the display picker, the genre and decade pickers) left innerHTML empty, so
+           // any assertion about them passed against "" no matter what the code did.
+           appendChild(c) {
+             if (!c) return;
+             this.innerHTML += c.innerHTML || c.textContent || "";
+           },
            querySelectorAll(){ return []; } };
 }
 global.document = {
@@ -74,12 +81,25 @@ const LEADERBOARD = [
   { player: "Carol", games: 1, total_score: 980, total_correct: 6, fastest_ms: 2400 },
 ];
 let leaderboardRows = LEADERBOARD;
+let filterCount = 400;   // wide enough for a game; a later case narrows it to prove the lock
 global.fetch = (url) => {
   fetched.push(url);
   if (typeof url === "string" && /audio|\.mp3|\/clips\//.test(url))
     return Promise.resolve({ ok: true, arrayBuffer: () => Promise.resolve(new ArrayBuffer(8)) });
   if (typeof url === "string" && url.startsWith("/api/leaderboard"))
     return Promise.resolve({ ok: true, json: () => Promise.resolve(leaderboardRows) });
+  // The idle screen's round-filter pickers and their pool preflight. Resolved for real so
+  // the count path (which disables Start when a combination is too narrow) is exercised
+  // rather than short-circuited by a thenable that never reaches .then.
+  if (typeof url === "string" && url.startsWith("/api/round-filters/count"))
+    return Promise.resolve({ ok: true, json: () => Promise.resolve(
+      { tracks: filterCount, enough_for_10: filterCount >= 10 }) });
+  if (typeof url === "string" && url.startsWith("/api/round-filters"))
+    return Promise.resolve({ ok: true, json: () => Promise.resolve({
+      total: 6607,
+      genres: [{ genre: "Pop", tracks: 5901 }, { genre: "Rock", tracks: 3928 },
+               { genre: "Reggae", tracks: 56 }],
+      decades: [{ decade: 1990, tracks: 2095 }, { decade: 1960, tracks: 208 }] }) });
   return { then: () => ({ then(){}, catch(){} }), catch(){} };
 };
 // Controllable clock + timers, so the payoff lock (which counts down against a
@@ -369,6 +389,66 @@ global.__remoteChecks = async () => {
   if (!/no games finished yet/.test(atList.innerHTML)) {
     console.log("empty leaderboard not explained:", atList.innerHTML); failures++; }
   leaderboardRows = LEADERBOARD;
+
+  // -- round filters on the idle screen ------------------------------------
+  // The pool preflight is the point of this UI: genre and decade are each plausible while
+  // their INTERSECTION is empty, so a choice that can't fill a game must lock Start HERE
+  // rather than being refused by the server at the moment of the tap.
+  const gbox = document.getElementById("genre-choice");
+  const dbox = document.getElementById("decade-choice");
+  const startBtn = document.getElementById("start-game");
+  const countTxt = document.getElementById("filter-count");
+
+  // two settles: the options fetch is a two-hop chain (response -> json), and the render
+  // that paints the pickers only happens after the second hop resolves
+  state = { phase: "idle", players: [] }; render(); await settle(); await settle();
+  if (!/Pop/.test(gbox.innerHTML) || !/Reggae/.test(gbox.innerHTML)) {
+    console.log("genre pickers missing:", gbox.innerHTML); failures++; }
+  if (!/5901/.test(gbox.innerHTML)) {
+    console.log("genre counts missing — a bare name gives no idea of pool size"); failures++; }
+  if (!/1990s/.test(dbox.innerHTML)) { console.log("decade pickers missing:", dbox.innerHTML); failures++; }
+  if (startBtn.disabled) { console.log("Start locked with no filters at all"); failures++; }
+  if (countTxt.textContent) { console.log("count shown with no filters:", countTxt.textContent); failures++; }
+
+  // picking a genre counts the pool and starts a filtered game
+  sent.length = 0;
+  toggleGenre("Rock"); await settle();
+  if (!/400 songs/.test(countTxt.textContent)) {
+    console.log("pool count not shown after picking a genre:", countTxt.textContent); failures++; }
+  if (startBtn.disabled) { console.log("Start locked on a 400-song pool"); failures++; }
+  startGame();
+  const ng = sent.filter(m => m.type === "new_game").pop();
+  if (!ng || JSON.stringify(ng.genres) !== JSON.stringify(["Rock"])) {
+    console.log("new_game did not carry the chosen genre:", JSON.stringify(ng)); failures++; }
+
+  // adding a decade sends a year RANGE, not a decade number
+  toggleDecade(1990); await settle();
+  sent.length = 0; startGame();
+  const ng2 = sent.filter(m => m.type === "new_game").pop();
+  if (!ng2 || ng2.year_from !== 1990 || ng2.year_to !== 1999) {
+    console.log("decade not sent as a year range:", JSON.stringify(ng2)); failures++; }
+
+  // a combination too narrow to fill 10 rounds must lock Start and say why
+  filterCount = 4; countKey = "";
+  toggleGenre("Reggae"); await settle();
+  if (!startBtn.disabled) { console.log("Start not locked on a 4-song pool"); failures++; }
+  if (!/only 4 songs/.test(countTxt.textContent)) {
+    console.log("narrow pool not explained:", countTxt.textContent); failures++; }
+  filterCount = 400;
+
+  // clearing every filter releases the lock again
+  countKey = "";
+  toggleGenre("Rock"); toggleGenre("Reggae"); toggleDecade(1990); await settle();
+  if (startBtn.disabled) { console.log("Start still locked after clearing the filters"); failures++; }
+
+  // and a themed game says so all game long, on every screen
+  state = { ...${JSON.stringify(snapshots[2])}, filter_label: "Rock · the 1990s" };
+  joined = true; render(); await settle();
+  const themeB = document.getElementById("theme-banner");
+  if (themeB.hidden || !/Rock · the 1990s/.test(themeB.textContent)) {
+    console.log("theme banner missing during a filtered game:", themeB.textContent); failures++; }
+  state = ${JSON.stringify(snapshots[2])}; render(); await settle();
+  if (!themeB.hidden) { console.log("theme banner shown for an unfiltered game"); failures++; }
 };
 `;
 eval(src.replace(/^connect\(\);?$/m, "") + scenario);
