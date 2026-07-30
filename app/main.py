@@ -436,8 +436,9 @@ def _job_bootstrap(set_stage) -> dict:
     finally:
         conn.close()
     stage("clips")
-    # the sweep drives `stage` itself from here on — it's hours of the bootstrap's
-    # runtime, and a fixed "clips" for all of it is what made abort look necessary
+    # The sweep drives `stage` from here on: this is hours of the bootstrap's
+    # runtime, and a fixed "clips" for all of it is the same blind spot _job_clips
+    # had. Abort still works — the sweep polls cancelled() between items.
     r = clips.sweep(set_stage=set_stage)
     out.update({"clips_cut": r.get("cut"), "clips_stopped": r.get("stopped")})
     return out
