@@ -1,5 +1,6 @@
 import logging
 import os
+import re
 import subprocess
 import time
 
@@ -254,9 +255,10 @@ def test_a_long_log_keeps_the_LAST_lines_not_the_first():
     wait_done("noisy")
     log = jobs.JOBS["noisy"]["log"]
     assert len(log) == jobs.LOG_LINES_MAX
-    # whole-line numbers, not substrings: "line 1" also matches "line 100"
-    kept = {int(line.rsplit(" ", 1)[1]) for line in log}
-    assert kept == set(range(100, 200)), sorted(kept)[:5]
+    # Match whole numbers, not substrings: "line 1" is inside "line 100", so an
+    # `in` check would call the head the tail and pass with the old sink in place.
+    kept = {int(n) for n in re.findall(r"line (\d+)$", "\n".join(log), re.M)}
+    assert kept == set(range(100, 200)), f"kept the wrong lines: {sorted(kept)[:5]}…"
 
 
 def test_a_truncated_log_says_so_when_the_api_serves_it():
