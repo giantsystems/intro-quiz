@@ -1,27 +1,38 @@
 # Next steps
 
-Where the work stands and what's worth doing next, easiest first. Written 2026-07-30 at
-v1.33.0 — every claim below was checked against the code or the running server at that
+Where the work stands and what's worth doing next. Written 2026-07-30, current as of
+v1.34.0 — every claim below was checked against the code or the running server at that
 point, with file references so you can re-check rather than trust it.
+
+Two sections. **Items 1–5** are improvements found by reading the code, easiest first.
+**Items 6–13** were requested by the project's owner, listed in the order asked. The split
+matters: the second group is what someone actually wants, so prefer it when the two
+compete, even though several are dearer.
 
 Nothing here is committed to. Each item says what's actually wrong, why it's worth
 doing, and what it costs; if a better idea turns up, do that instead.
 
+**Cheap wins, if you want a short list:** item 13 is a couple of hours because the server
+already takes the parameter, and item 8 may be mostly layout. Items 4 and 11 have hard
+prerequisites, stated in place.
+
 ## Where things stand
 
-v1.33.0 is tagged, released, and running in production. It shipped five improvements:
-genre + decade round filters, a non-empty `easy` tier, cross-game track history,
+**v1.34.0** is running in production, deployed 2026-07-30. It shipped items 1, 2 and 6:
+honest job progress, case-folded player names, and genre exclusion. v1.33.0 before it
+brought genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
 - **Tests:** 259 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
-- **Library:** 23,083 tracks synced, 22,888 tiered
-  (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
-- **Clips:** ~18,000 of 22,888 cut, 26G, with 69G free on the clip disk. The sweep
-  resumes on each container start and **needs re-running after any deploy** that
-  restarts the container mid-sweep.
-- **Leaderboard:** empty. `rounds_played: 0` — no games have been played to completion
-  since the database was last dealt with. That emptiness is what made item 2 free to fix.
+- **Library:** 23,083 tracks synced, 22,888 tiered.
+- **Clips: the sweep is finished.** `clips_remaining: 0`, and `playable_by_tier` reads
+  `easy` 1,174 / `medium` 5,433 / `hard` 7,481 / `tiebreak` 7,776 — 21,864 of 22,888 tiered
+  tracks have a clip, the rest being rows the cutter can't use. Earlier notes here warned
+  the sweep needed re-running after every deploy; that no longer applies, and those fields
+  are how you'd tell rather than counting files over SSH.
+- **Leaderboard:** empty at the time item 2 landed (`rounds_played: 0`), which is what made
+  the case fold free to fix — no rows to migrate.
 
 Read [fork-changes.md](fork-changes.md) before touching anything that might conflict with
 upstream, and [development.md](development.md) to get a local environment without
@@ -159,6 +170,267 @@ restart mid-game? If the honest answer is "almost never", then a clear *"that ga
 lost — start a new one"* on reconnect delivers most of the value for a fraction of the
 work. Decide that before writing anything; the full version is only worth a week if
 mid-game restarts actually happen.
+
+---
+
+# Requested features
+
+Asked for on 2026-07-30, listed in the order they were requested rather than by cost.
+The cost estimates and the notes on what's already in place were checked against the code
+the same day. Items 6, 8 and 13 are cheap; item 11 is explicitly a maybe-never.
+
+## 6. Exclude genres from a game
+
+**Cost:** a day. **Cheap, and there's a concrete reason to want it.**
+
+`filter_sql` ([game.py:80-82](../app/game.py#L80-L82)) only supports `genre IN (...)` —
+include-only. Excluding means adding a `NOT IN` arm, plus somewhere in the UI to express
+it, plus threading it through `pool_count` and the preflight the same way genres already
+are.
+
+**The use case is already visible in the library:** the tags include **`NotForKids` with
+144 tracks**. Excluding one tag is the natural way to say "family game, skip those",
+and today the only way to get that is to tick the other 19 genres.
+
+**The subtlety that decides the design:** exclude is *not* the same as ticking everything
+else. The picker only offers genres with at least `min_tracks` (25) tracks — 20 of them,
+covering 6,327 of the 6,607 quizzable tracks. **280 tracks (4%) have a genre that isn't
+in the picker at all**, or none. Ticking all 20 includes those 280 nowhere; `NOT IN
+('NotForKids')` includes them all. Both are defensible, but they're different games, and
+whichever you pick should be what the UI plainly says. Note also that a track has one
+`genre` value, so exclusion can't miss a track via a second tag.
+
+Watch the interaction with the existing preflight: exclusion shrinks the pool too, so
+`enough_for_10` must account for it, and the `filter_label`
+([game.py:580](../app/game.py#L580)) needs to read sensibly for a negative filter.
+
+## 7. Optional admin login on the landing page, with navigation
+
+**Cost:** 1–2 days. **The auth primitive already exists — this is mostly UI.**
+
+Today `/admin` is reachable only by knowing the URL, and admin auth is a token in
+`localStorage` sent as an `X-Admin-Token` header ([admin.js:13,29](../app/static/admin.js#L13),
+checked by `require_admin` at [main.py:25](../app/main.py#L25)). `admin.js` already
+`prompt()`s for the password on a 401 and stores it. So the mechanism works; what's
+missing is a way in from the front page and a way to move around once you're in.
+
+**The requirement that shapes it:** logging in must be entirely optional, and a normal
+player who ignores it sees today's join screen unchanged. So this is an unobtrusive
+control on the landing page — not a login wall — that, once used, reveals links to
+`/admin`, `/health`, `/board` and **back to the game in progress**, switchable without
+retyping a URL.
+
+Two things worth deciding early. First, `ADMIN_PASSWORD` may be **unset**, in which case
+`check_token` ([jobs.py:68-70](../app/jobs.py#L68)) treats everything as open — decide
+whether the button appears at all then, or admits everyone. Second, this is a real
+security boundary being made discoverable: today obscurity is part of the protection, and
+a visible button removes that. `X-Admin-Token` is a header rather than a cookie, so it
+isn't sent cross-site, but it also isn't a session — there's no expiry and no logout.
+Add a logout that clears `localStorage` at minimum.
+
+## 8. Show more on the scoreboard
+
+**Cost:** 1–2 days. **Partly already there — check before rebuilding.**
+
+The request is: who's local and who's remote, a sensible no-game-active state, the current
+round, and who got the last one right. Three of those four exist in some form:
+
+- **Remote marker** — 🌐 already renders per player
+  ([board.html:367](../app/static/board.html#L367)).
+- **Who got it right** — already shown at reveal as `name ✅ +points` / `name ❌`
+  ([board.html:334-340](../app/static/board.html#L334)).
+- **Round number** — `round` and `total_rounds` are both in the snapshot
+  ([game.py:596-597](../app/game.py#L596)); whether they're *prominent* is the question.
+- **Idle state** — there is a `#b-idle` card ([board.html:46](../app/static/board.html#L46)),
+  currently the join QR.
+
+So read the board on a real screen first and decide what's genuinely missing versus what's
+present but too small or too transient. This is likely a layout and prominence job rather
+than new plumbing — and if any new *data* is needed, that's a `snapshot()` change
+([game.py:591](../app/game.py#L591)) which the phone UI and both node smokes also read.
+Keep `make test-js` green; it renders every phase for exactly this reason.
+
+## 9. Discover Chromecasts from /admin and pick one in flight
+
+**Cost:** 2–3 days. **The networking approach is decided — see below.**
+
+Today `DISPLAYS` is parsed from the environment **at import time** as hardcoded `Name=ip`
+pairs ([board_cast.py:12-19](../app/board_cast.py#L12-L19)) — there is no discovery. Worth
+knowing: **`DISPLAYS` is not set in production**, so casting is currently unconfigured
+altogether. This item is what would make it usable without hand-collecting IPs.
+
+The pinned `pychromecast` 14.0.10 does expose discovery — `get_chromecasts()`,
+`discover_chromecasts()`, `start_discovery()` — so the library can do it.
+
+### The networking constraint, and the decided approach
+
+Discovery is mDNS/zeroconf multicast, and `docker-compose.yml` uses **default bridge
+networking with a published port** ([docker-compose.yml:12](../docker-compose.yml#L12)).
+Multicast does not cross a bridge network, so `get_chromecasts()` from inside the container
+finds **nothing**. The existing `get_chromecast_from_host()` path is unaffected, because it
+dials a known IP directly.
+
+**Decision (owner, 2026-07-30): give the container its own real LAN IP** — a macvlan (or
+ipvlan) network — **as an opt-in extra in `docker-compose.yml`, only needed if you want
+scanning.** The LAN in question is known to carry mDNS. Default deployment stays on bridge
+with today's published port, so nothing changes for anyone who doesn't want discovery.
+
+Why a real IP rather than `network_mode: host`: host mode puts the app straight onto the
+host's port 8000, and **8000 is already taken on this host** — that's the collision
+`QUIZ_PORT` exists to dodge (see the port trap in the working rules below). A macvlan
+address gives the container its own port 8000 with nothing to collide with, and keeps
+multicast intact.
+
+**Consequences to handle, not discover later:**
+
+- **The app's address changes** on the macvlan path — it's the container's LAN IP, not
+  `host:QUIZ_PORT`. `BOARD_URL`, `JOIN_URL` and `APP_BASE_URL` are all absolute and would
+  need to match, as would whatever reverse proxy fronts it (`APP_BASE_URL` is currently an
+  HTTPS name, so the proxy target moves). Get this wrong and the board still loads while
+  the join QR points somewhere unreachable.
+- **Macvlan needs a parent interface named in the compose file**, which is host-specific —
+  exactly the kind of deployment detail that must come from `.env`, never a committed
+  literal. See the working rules below.
+- **The host usually cannot reach its own macvlan container** without an extra route. Bear
+  it in mind when a health check from the host itself starts failing for no apparent
+  reason.
+- **Make it genuinely optional.** Compose can't toggle a network block with a plain
+  variable, so this likely wants a documented override file (e.g. an opt-in
+  `docker-compose.macvlan.yml` used with `-f`) rather than edits to the committed default.
+- Keep `known_hosts` / manual `DISPLAYS` working regardless, as the fallback for anyone on
+  bridge — discovery should *add* to that path, not replace it.
+
+Probe before building UI: bring the container up on the macvlan and confirm
+`get_chromecasts()` actually returns devices. Everything above assumes it does; the LAN
+carries mDNS, but this is the one step worth proving rather than assuming.
+
+Also note the existing "pick in flight" pattern to copy rather than reinvent: the `hub`
+already holds a mutable `display` and the `set_display` websocket handler already swaps
+it, hiding the old board first ([main.py:786-788](../app/main.py#L786)). Discovery should
+feed that mechanism, not replace it. Cast failures must stay non-fatal — `show_board`
+swallows exceptions on purpose ([board_cast.py:68](../app/board_cast.py#L68)), because the
+board is cosmetic and must never break a game.
+
+## 10. A display-only dashboard page for AirPlay
+
+**Cost:** 1–2 days. **The pragmatic answer to the Apple TV problem, and it's a real gap.**
+
+Apple TV was investigated before and **shelved as genuinely impossible**: HA can control
+the TVs, but tvOS has no browser in any source list, so `select_source` and `play_media`
+cannot put a web page on one. Mirroring a browser from another device sidesteps that
+entirely, and needs nothing from HA.
+
+`/board` is already a plain page any browser can open
+([main.py:1047](../app/main.py#L1047)), so you can *almost* do this today. **The reason a
+separate page is the right call:** `/board` plays the round audio — it owns an
+`AudioContext` and fetches every clip ([board.html:123-194](../app/static/board.html#L123)),
+including the "Tap anywhere for sound" unlock overlay. AirPlay-mirroring it would send the
+clip out of the TV *as well as* the room speaker: echo, and a second unlock tap on a
+device nobody is holding.
+
+So the deliverable is a **display-only** view: same state feed over the websocket, same
+scoreboard, **no audio path at all** and no unlock overlay. Factor the render out of
+`board.html` rather than forking it, or the two drift. This pairs naturally with item 8 —
+same rendering work, and a mirrored screen is exactly where a better scoreboard pays off.
+
+Set expectations honestly in the doc you write: starting the mirror is a manual
+Control Centre action on the iPad or Mac. The server cannot initiate it, and that's a
+platform limit, not a shortcoming to fix later.
+
+## 11. Multiple concurrent games
+
+**Cost:** weeks. **Explicitly a maybe-never — the requester said so, and the code agrees.**
+
+`hub = Hub()` is a **module-level singleton** ([main.py:624](../app/main.py#L624))
+referenced **121 times** in `main.py`. Every websocket handler takes its hub from the
+session, every HTTP route reads the global, and neither `board.html` nor `quiz.js` has any
+concept of a room or game id — **zero occurrences** in either. So this isn't a feature
+you add, it's a change of shape: every route, both clients, and the websocket protocol all
+grow a room dimension.
+
+It's worse than a naming problem, because real single-instance resources are bound to that
+singleton and cannot simply be duplicated: `hub.display` is one cast display,
+`group_snapshot` is one set of grouped speakers, and the house speaker is one speaker. Two
+concurrent games cannot both own them. That's a product decision — do rooms share a board,
+or does only one game get audio? — not a refactor.
+
+**If it's ever wanted, do items 3 (route coverage) and 4 (split `main.py`) first.** Having
+the routes tested and the module split is the difference between a hard change and an
+unsafe one. Until then this is a note about why the code looks the way it does, not a plan.
+
+## 12. Bring the player-facing instructions up to date with the fork
+
+**Cost:** half a day, most of it deciding what to leave out.
+
+The **"How to play" card** on the join screen
+([index.html:17](../app/static/index.html#L17)) still described upstream's game. One line
+was actively wrong — *"Stuck? Ask for a few more seconds"* implies a player-facing control,
+but the replay is the game master's, and it fires only when nobody has answered
+([main.py:627](../app/main.py#L627)). Four fork features were missing: remote players
+hearing audio on their own phone, boost rounds, half-time trivia, and the all-time table.
+That card is now fixed; **the rest of this item is the same job everywhere else.**
+
+Worth checking, in rough order of how visible it is to a player:
+
+- **`v-master`** ([index.html:55](../app/static/index.html#L55)) lists what the master runs.
+  It reads well, but verify it against what the buttons now do — it predates the payoff-skip
+  change, where upstream's hard 12-second lock became a two-second grace.
+- **The `/board` screens** — idle, question, reveal, half time, finished. A TV in a room full
+  of people is read by everyone at once, and it's the one surface nobody can ask questions
+  about.
+- **`README.md`** — the feature list is a fork/upstream mix. [fork-changes.md](fork-changes.md)
+  is accurate and current; the README is what someone reads first.
+- **[setup.md](setup.md)** — accurate as far as it goes, but written incrementally per
+  feature. Remote players, speaker grouping, genre filters and exclusions each landed
+  separately, so a first-time reader gets the pieces in implementation order rather than
+  the order they'd set them up.
+
+**Why it's worth doing:** every one of these is a promise to a player. A wrong instruction
+costs more than a missing one — the player follows it, it doesn't work, and they conclude
+the app is broken rather than the text. The "ask for a few more seconds" line was that bug
+in miniature for however long it sat there.
+
+**Test it by** reading each screen as somebody who has never played, and by running
+`make test-js` — the two node smokes render every phase, so a broken tag fails there rather
+than on the night.
+
+## 13. Choose the number of rounds
+
+**Cost:** a couple of hours for the control, plus the decisions below.
+
+**The server already supports this.** `Game.__init__` takes `rounds`
+([game.py:305](../app/game.py#L305)) and the `new_game` handler already reads it
+([main.py:853](../app/main.py#L853)) — it's the phone that hardcodes the value:
+
+```js
+const msg = {type: "new_game", rounds: 10};   // quiz.js:531
+```
+
+So the work is a control on the idle card next to the theme and exclusion walls, and
+`total_rounds` is already in the snapshot and already rendered
+([quiz.js:612](../app/static/quiz.js#L612)), so the board and phone follow automatically.
+
+Three things need deciding, and they're the actual work:
+
+- **Half time only exists at 6+ rounds.** `is_halfway` is
+  `len(self.rounds) >= 6 and self.current + 1 == len(self.rounds) // 2`
+  ([game.py:661](../app/game.py#L661)), so a 4-round game silently has no trivia break.
+  That's defensible — but say so in the UI rather than letting it surprise the master.
+- **The pool preflight assumes 10.** There's an `enough_for_10` check that refuses a filter
+  selection too narrow to fill a game; a 5-round game could legitimately play a pool that
+  currently gets refused. Make the preflight use the chosen count, or a short game with a
+  tight theme will be blocked for no reason.
+- **Boost rounds are one per player** ([game.py:366](../app/game.py#L366)). Six players in a
+  4-round game means the boost rounds don't fit. Decide what gives — fewer boosts, or a
+  floor on the round count relative to the lobby size.
+
+**Why it's worth doing:** ten rounds is roughly 25 minutes with the reveals. A short game
+is the difference between "one more?" and "not tonight", and a long one suits a party that's
+settled in. The upstream constant is a guess about your evening.
+
+**Test it by** playing a 3-round and a 20-round game: assert `total_rounds` is honoured, that
+half time fires only where it should, and that a narrow filter which fills a short game is
+no longer refused.
 
 ---
 
