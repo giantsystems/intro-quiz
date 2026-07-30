@@ -13,7 +13,7 @@ v1.33.0 is tagged, released, and running in production. It shipped five improvem
 genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
 
-- **Tests:** 240 python + two node smokes (`make test`, `make test-js`). All green.
+- **Tests:** 249 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
 - **Library:** 23,083 tracks synced, 22,888 tiered
   (`easy` 1,286 / `medium` 5,720 / `hard` 7,841 / `tiebreak` 8,041).
@@ -21,7 +21,7 @@ abortable admin jobs with an honest 409, and the websocket handler table.
   resumes on each container start and **needs re-running after any deploy** that
   restarts the container mid-sweep.
 - **Leaderboard:** empty. `rounds_played: 0` — no games have been played to completion
-  since the database was last dealt with. This matters for item 2.
+  since the database was last dealt with. That emptiness is what made item 2 free to fix.
 
 Read [fork-changes.md](fork-changes.md) before touching anything that might conflict with
 upstream, and [development.md](development.md) to get a local environment without
@@ -60,28 +60,43 @@ Every claim above has a test that fails if the fix is reverted; each was proved 
 injecting the old behaviour back. The log-tail test asserts *which* lines survived
 rather than how many — a length check passes with a first-N sink too.
 
-## 2. Fold leaderboard names by case
+## 2. Fold leaderboard names by case — **DONE**
 
-**Cost:** half a day. **Do it now rather than later — see the timing note.**
+Done on 2026-07-30, inside the window: the production leaderboard was still empty
+(`rounds_played: 0`), so no data migration was needed and none was written.
 
-`all_time_leaderboard` ([game.py:644](../app/game.py#L644)) does `GROUP BY player` on a
-plain `TEXT` column, and `join` ([game.py:313](../app/game.py#L313)) only normalises with
-`.strip()[:24]`. So `steve` and `Steve` accumulate as two separate all-time rows, and a
-returning player silently loses their history by typing a lowercase name.
+`all_time_leaderboard` now groups `COLLATE NOCASE`
+([game.py:697](../app/game.py#L697)), and the lobby treats a case-variant of an existing
+name as the SAME player ([game.py:333](../app/game.py#L333)) — joining as `robin` while
+`Robin` is playing hands back Robin's seat and score instead of opening a second one.
+That mattered beyond the leaderboard: `results` is keyed `(game_id, player)`
+([db.py:49-56](../app/db.py#L49-L56)), so two spellings would have split one night's
+score in two before the all-time query ever saw it.
 
-**Timing is the whole point:** the production leaderboard is **currently empty**, so this
-is latent. Fixed now it's a `COLLATE NOCASE` on the group-by plus a decision about which
-capitalisation to display. Fixed after real history accrues, it's merging rows by hand and
-adjudicating whose score is whose. The window is open; it closes the first time someone
-finishes a game.
+Two decisions worth knowing about, both deliberate:
 
-Note the `results` primary key is `(game_id, player)`
-([db.py:49-56](../app/db.py#L49-L56)), so two spellings can also coexist *within* one
-game. Decide whether `join` should reject a name that differs only by case from one
-already in the lobby.
+- **Display is Title Case, always** — one function, `display_name`
+  ([game.py:55](../app/game.py#L55)). It is applied over the grouped rows because
+  `GROUP BY ... COLLATE NOCASE` returns an *arbitrary* member spelling for the selected
+  column, so without it the name on the board depended on which row SQLite happened to
+  pick. The accepted cost is that it flattens `JB` to `Jb` and `McDonald` to `Mcdonald`.
+  Refine it there if it ever grates; `resolve_name` folds on `casefold()` separately, so a
+  refinement that stops being a total case fold still cannot split one player into two
+  seats.
+- **Every entry point resolves the name, not just `join`.** The phone keeps sending the
+  spelling the player typed on `answer`, `ready` and the rest, and all of those check
+  membership — folding only in `join` would have seated `robin` as `Robin` and then told
+  them "join first" for the whole game. `on_join` re-claims the socket's name in the
+  seated spelling too ([main.py:860](../app/main.py#L860)), or a master whose phone
+  autocapitalised would be refused control of their own rounds. On the phone,
+  `adoptSeatedName` ([quiz.js:97](../app/static/quiz.js#L97)) takes the server's spelling
+  so the "is this me?" comparisons in `render()` keep working.
 
-**Test it by** inserting mixed-case rows and asserting one grouped row out, and that the
-displayed name is the one you chose deliberately.
+**Tests:** 9 new (236 python total). Each was verified by reverting the fix and watching
+it fail — including the two subtle ones: `COLLATE NOCASE` *without* `display_name` still
+passes a naive one-row assertion, and folding only in `join` passes everything except a
+full game played under mixed spellings. The board needed no change; it renders snapshot
+keys and the already-folded API rows.
 
 ## 3. Cover the HTTP surface, starting with the answer-leak guard
 
