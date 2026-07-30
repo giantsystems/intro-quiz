@@ -92,6 +92,32 @@ def test_intro_offset_respected(tone, tmp_path):
         os.unlink(p)
 
 
+def test_cut_batch_reports_after_every_track_including_the_failures(monkeypatch, tmp_path):
+    """A batch is up to an hour of downloading, so a caller watching progress needs
+    a tick per track. Failures must tick too: a run where every track errors would
+    otherwise look completely silent, which is exactly the "is it wedged?" question.
+
+    cut_track is faked — this is the loop and its reporting, not ffmpeg.
+    """
+    conn, p = make_db([{"id": "t1"}, {"id": "bad"}, {"id": "t3"}])
+    seen = []
+
+    def fake_cut(client, row, clips_dir):
+        if row["id"] == "bad":
+            raise clips.ClipError("undecodable")
+        return 0
+
+    monkeypatch.setattr(clips, "cut_track", fake_cut)
+    try:
+        r = clips.cut_batch(conn, object(), limit=10, clips_dir=str(tmp_path),
+                            on_progress=lambda cut, errors: seen.append((cut, errors)))
+    finally:
+        os.unlink(p)
+    assert r["cut"] == 2 and r["errors"] == 1
+    # the running totals as each track lands: the middle one is the banned failure
+    assert seen == [(1, 0), (1, 1), (2, 1)]
+
+
 class DummyConn:
     """Stands in for db.connect() in sweep tests — answers the tiered-count query."""
     tiered = 100
@@ -176,6 +202,117 @@ def test_sweep_stops_when_the_job_is_aborted(monkeypatch):
         jobs._CANCEL.clear()
     assert out == {"cut": 10, "stopped": "aborted"}
     assert len(calls) == 2      # stopped at the boundary, didn't grind on
+
+
+def test_sweep_stage_moves_between_batches(monkeypatch):
+    """`stage` is the only progress signal /admin has for a multi-hour sweep, and
+    it used to read "starting" for the entire run because _job_clips dropped the
+    callback. On that evidence a healthy sweep was declared wedged three times and
+    aborted, costing ~11 hours of cutting.
+
+    Two batches, so this asserts the stage MOVES rather than merely differing from
+    "starting" — a callback fired once at the top would satisfy that weaker check
+    while leaving the number frozen for the rest of the session.
+    """
+    results = [{"cut": 8, "errors": 0, "remaining": 12},
+               {"cut": 12, "errors": 0, "remaining": 0}]
+    stages = []
+
+    def fake_batch(conn, client, limit=100, on_progress=None):
+        stages.append(("batch", None))       # marks where in the sequence we are
+        return results.pop(0)
+
+    monkeypatch.setattr(clips, "cut_batch", fake_batch)
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    out = clips.sweep(stall_sleep_s=0,
+                      set_stage=lambda text, log=True: stages.append(("stage", text)))
+    assert out == {"cut": 20, "stopped": "done"}
+    said = [t for kind, t in stages if kind == "stage"]
+    assert said, "the sweep reported no progress at all"
+    # the counts really advance: 8 cut after the first batch, and the backlog falls
+    assert len(set(said)) > 1, f"stage never changed: {said}"
+    assert any("0 cut" in s for s in said)       # before any batch ran
+    assert any("8 cut" in s for s in said)       # after the first
+    # ...and it was said BETWEEN the batches, not all of it at the end
+    first_batch = stages.index(("batch", None))
+    second_batch = stages.index(("batch", None), first_batch + 1)
+    between = [t for kind, t in stages[first_batch + 1:second_batch] if kind == "stage"]
+    assert any("8 cut" in t for t in between), f"nothing reported between batches: {between}"
+
+
+def test_sweep_reports_progress_per_clip_not_just_per_batch(monkeypatch):
+    """A batch is 100 downloads — up to an hour. Reporting only per batch leaves
+    `stage` frozen for that hour, which is indistinguishable from wedged.
+
+    The per-clip ticks must NOT log: thousands of them would flush the 100-line
+    tail (and `docker logs`) of the warnings worth reading.
+    """
+    def fake_batch(conn, client, limit=100, on_progress=None):
+        for i in range(1, 4):
+            on_progress(i, 0)
+        return {"cut": 3, "errors": 0, "remaining": 0}
+
+    monkeypatch.setattr(clips, "cut_batch", fake_batch)
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    said = []
+    clips.sweep(stall_sleep_s=0,
+                set_stage=lambda text, log=True: said.append((text, log)))
+    ticks = [t for t, log in said if not log]
+    assert len(ticks) == 3, f"expected one tick per clip: {said}"
+    assert ticks[0] != ticks[-1], f"ticks never moved: {ticks}"
+    # DummyConn reports 100 pending, so the countdown is visible in the text
+    assert "1 cut this session, 99 to go" in ticks[0]
+    assert "3 cut this session, 97 to go" in ticks[-1]
+
+
+def test_a_stalled_sweep_says_it_is_backing_off(monkeypatch):
+    """The one state that genuinely looks like a stall. Saying so beats a frozen
+    "cutting", which is what got read as wedged — the operator needs to know the
+    sweep is waiting on Navidrome, not stuck."""
+    monkeypatch.setattr(clips, "cut_batch",
+                        lambda conn, client, limit=100, on_progress=None:
+                        (_ for _ in ()).throw(Exception("down")))
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    said = []
+    out = clips.sweep(stall_sleep_s=0, max_stalls=3,
+                      set_stage=lambda text, log=True: said.append(text))
+    assert out["stopped"] == "stalled"
+    backoffs = [t for t in said if "backing off" in t]
+    assert len(backoffs) == 2, f"expected one per backoff before giving up: {said}"
+    assert "attempt 1 of 3" in backoffs[0] and "attempt 2 of 3" in backoffs[1]
+
+
+def test_an_aborted_sweep_reports_aborted_and_the_progress_it_made(monkeypatch):
+    """Progress plumbing must not swallow the abort path. A cancelled sweep still
+    reports "aborted" — never a cheerful "done" — and the stage it leaves behind
+    must show the work it did, because that work is kept and resumed."""
+    from app import jobs
+    calls = []
+
+    def fake_batch(conn, client, limit=100, on_progress=None):
+        calls.append(1)
+        on_progress(4, 0)
+        if len(calls) == 2:
+            jobs._CANCEL.set()      # as /api/admin/abort would, mid-session
+        assert len(calls) < 50, "sweep ignored the abort and kept batching"
+        return {"cut": 4, "errors": 0, "remaining": 9999}
+
+    monkeypatch.setattr(clips, "cut_batch", fake_batch)
+    monkeypatch.setattr(clips.db, "connect", lambda *a, **k: DummyConn())
+    monkeypatch.setattr(clips.subsonic, "Client", lambda: object())
+    said = []
+    try:
+        out = clips.sweep(stall_sleep_s=0,
+                          set_stage=lambda text, log=True: said.append(text))
+    finally:
+        jobs._CANCEL.clear()
+    assert out == {"cut": 8, "stopped": "aborted"}
+    assert len(calls) == 2                      # stopped at the boundary
+    assert any("4 cut" in t for t in said)      # first batch's progress reported
+    assert any("8 cut" in t for t in said)      # and the second's, before stopping
 
 
 def test_sweep_wakes_early_from_a_stall_backoff_when_aborted(monkeypatch):

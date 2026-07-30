@@ -318,6 +318,144 @@ def test_the_served_log_is_a_json_array_not_a_deque():
         wait_done("clips")
 
 
+def test_the_clips_job_passes_set_stage_to_the_sweep(monkeypatch):
+    """_job_clips accepted the callback and dropped it, so `stage` stayed on
+    "starting" for the sweep's whole multi-hour run. That frozen field is what a
+    healthy sweep was judged wedged on, three times.
+
+    The sweep itself is faked: this asserts the wiring, which is the bit that was
+    missing — tests/test_clips.py covers what the sweep says.
+    """
+    from app import main
+    got = {}
+
+    def fake_sweep(max_hours=0, set_stage=None):
+        got["callback"] = set_stage
+        set_stage("cutting — 7 cut this session, 3 to go")
+        return {"cut": 7, "stopped": "done"}
+
+    monkeypatch.setattr(main.clips, "sweep", fake_sweep)
+    jobs.register("clips", "Clip cutting", main._job_clips)
+    jobs.start("clips")
+    wait_done("clips")
+    assert got["callback"] is not None, "the sweep was handed no progress callback"
+    # and what it said actually reached the record the admin page reads
+    j = jobs.JOBS["clips"]
+    assert j["stage"] == "done"          # resolved by _run_wrapped, as before
+    assert any("7 cut this session" in line for line in j["log"]), list(j["log"])
+
+
+def test_a_progress_tick_moves_the_stage_without_logging_it():
+    """The sweep ticks once per clip — thousands per session. Logging each would
+    flush the 100-line tail of the warnings that matter, so a tick moves `stage`
+    and stays out of the log; the per-batch lines carry the story there.
+
+    `stage` is read MID-RUN, because _run_wrapped overwrites it with done/aborted
+    the moment the job returns — checking afterwards would prove nothing.
+    """
+    import threading
+    ticked, release = threading.Event(), threading.Event()
+
+    def ticker(set_stage):
+        set_stage("batch done")                                  # logged
+        set_stage("cutting — 2 cut this session, 98 to go", log=False)   # not
+        ticked.set()
+        release.wait(3)
+        return {}
+
+    jobs.register("ticks", "Ticks", ticker)
+    jobs.start("ticks")
+    try:
+        assert ticked.wait(3)
+        # the quiet tick still won the field /admin displays
+        assert jobs.JOBS["ticks"]["stage"] == "cutting — 2 cut this session, 98 to go"
+    finally:
+        release.set()
+        wait_done("ticks")
+    log = "\n".join(jobs.JOBS["ticks"]["log"])
+    assert "batch done" in log
+    assert "2 cut this session" not in log, "a per-clip tick must not spend a log line"
+
+
+def _health_db(path):
+    """A library mid-sweep: every tier represented, some clipped, some not.
+
+    Tier counts are all DIFFERENT and none is the sum of the others, so a field
+    wired to the wrong tier can't accidentally read correct. The three rows at the
+    end are the exclusions QUIZZABLE applies, so tracks_playable_all_tiers is not
+    simply "every row with a tier".
+    """
+    from app import db as adb
+    conn = adb.connect(path)
+    rows = []
+    # clipped and playable: easy 2, medium 3, hard 4, tiebreak 5
+    for tier, n in (("easy", 2), ("medium", 3), ("hard", 4), ("tiebreak", 5)):
+        for i in range(n):
+            rows.append((f"{tier}{i}", tier, 200, "2026-01-01", 0))
+    # tiered but not yet cut — the sweep's backlog (2 easy, 1 hard)
+    for tier, n in (("easy", 2), ("hard", 1)):
+        for i in range(n):
+            rows.append((f"{tier}-pending{i}", tier, 200, None, 0))
+    # excluded from BOTH counts, for three different reasons
+    rows.append(("banned", "easy", 200, "2026-01-01", 1))    # banned
+    rows.append(("tooshort", "easy", 9, "2026-01-01", 0))    # under MIN_DURATION_S
+    rows.append(("untiered", None, 200, "2026-01-01", 0))    # never scored
+    conn.executemany(
+        "INSERT INTO tracks(id,title,artist,duration,tier,clipped_at,banned,active) "
+        "VALUES(?,'t','a',?,?,?,?,1)",
+        [(r[0], r[2], r[1], r[3], r[4]) for r in rows])
+    conn.commit()
+    conn.close()
+
+
+def test_health_reports_every_tier_because_the_sweep_cuts_every_tier(monkeypatch, tmp_path):
+    """tracks_playable counts easy+medium only, so it can sit still through hours of
+    real cutting — hard and tiebreak are most of a real library. A watcher reading
+    only that key concluded the sweep was wedged and it was killed.
+
+    So /health now also answers per tier, and clips_remaining answers the question
+    directly. tracks_playable's own meaning is asserted UNCHANGED below: external
+    watchers read it, and ready_to_play is the same population.
+    """
+    from fastapi.testclient import TestClient
+    from app import db as adb, main
+    path = str(tmp_path / "h.db")
+    _health_db(path)
+    real_connect = adb.connect     # main.db IS this module — grab it before patching
+    monkeypatch.setattr(main.db, "connect", lambda *a, **k: real_connect(path))
+    body = TestClient(main.app).get("/health").json()
+
+    assert body["playable_by_tier"] == {"easy": 2, "medium": 3, "hard": 4, "tiebreak": 5}
+    assert body["tracks_playable_all_tiers"] == 14
+    # the backlog the cutter's next batch will draw from: 2 easy + 1 hard, and
+    # NOT the banned/too-short/untiered rows, which no batch will ever pick up
+    assert body["clips_remaining"] == 3
+
+    # --- the promise to external watchers: still easy+medium, still nothing else
+    assert body["tracks_playable"] == 5
+    assert body["ready_to_play"] is False        # 5 < 10, same threshold as before
+    assert body["tracks_synced"] == 20           # every active row: 14 + 3 + 3
+    assert body["tracks_tiered"] == 19           # ...all but the untiered one
+
+
+def test_health_survives_an_unreadable_db_without_the_new_fields(monkeypatch):
+    """health must never 500 — it's the liveness probe. The per-tier queries are
+    three more chances to throw, so the guard is worth re-asserting around them."""
+    from fastapi.testclient import TestClient
+    from app import main
+
+    def boom(*a, **k):
+        raise RuntimeError("disk gone")
+
+    monkeypatch.setattr(main.db, "connect", boom)
+    r = TestClient(main.app).get("/health")
+    assert r.status_code == 200
+    body = r.json()
+    assert body["ready_to_play"] is False and "disk gone" in body["message"]
+    # partial data is worse than none: a watcher must not read a missing tier as 0
+    assert "playable_by_tier" not in body
+
+
 def test_check_token(monkeypatch):
     monkeypatch.setattr(config, "ADMIN_PASSWORD", "")
     assert jobs.check_token("")
