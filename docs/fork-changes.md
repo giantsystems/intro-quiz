@@ -48,6 +48,29 @@ showed a hand on hover and then swallowed the tap in silence — disabled button
 and it got reported as broken. Disabled buttons across the phone UI are now greyed and
 show `not-allowed`.
 
+### The game master chooses how many rounds
+
+Upstream plays ten rounds, always: `Game.__init__` takes a `rounds` argument but nothing
+ever passes anything but the default, and the phone hardcoded `rounds: 10` into the
+`new_game` message. Here the idle card has a **How many rounds?** wall — 3 / 5 / 10 / 15 /
+20, still ten by default — and the count is validated server-side against `MIN_ROUNDS` /
+`MAX_ROUNDS` ([game.py:37-38](../app/game.py#L37-L38)) because it now arrives off a phone.
+
+Two consequences that upstream never had to face, since a fixed ten avoids both:
+
+- **The pool preflight was hardwired to ten.** `/api/round-filters/count` refused any
+  filter combination that couldn't fill 10 rounds, so a tight theme with 6 playable tracks
+  locked Start even for a 5-round game. It now takes `rounds=` and answers `enough` against
+  that; the old `enough_for_10` key is still returned unchanged, because it was published.
+- **Half time and boost rounds have floors.** Half time needs 6+ rounds
+  ([game.py:42](../app/game.py#L42), enforced in `is_halfway`), and a game of *n* rounds
+  has only *n−1* boost slots because `build_rounds` keeps a neutral round back. Both were
+  silent before; the phone now warns about each — the half-time one under the round buttons,
+  the boost one in the lobby, where the lobby size is finally known. `build_rounds` also
+  **shuffles** the players before handing boosts out; it previously walked `self.players` in
+  join order, so on any lobby too big to fit, the fastest phone won every time. See
+  [setup.md](setup.md#how-long-a-game-is).
+
 ### Library hygiene and artist-variant folding
 
 Upstream assumes reasonably clean tags. A 23,000-track library built up over two decades

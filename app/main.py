@@ -205,8 +205,14 @@ def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
             f"AND tier IN ({qmarks}) AND year BETWEEN ? AND ? "
             "GROUP BY d HAVING c>=? ORDER BY d DESC",
             (*tl, game.YEAR_MIN, game.YEAR_MAX, min_tracks))]
+        # The round-count buttons come from here too, with the rules that shape their labels,
+        # so the phone renders what the server will actually honour instead of keeping its
+        # own copy of the list to fall out of step with.
         return {"tiers": tl, "min_tracks": min_tracks,
-                "total": game.pool_count(conn, tl), "genres": genres, "decades": decades}
+                "total": game.pool_count(conn, tl), "genres": genres, "decades": decades,
+                "round_choices": list(game.ROUND_CHOICES),
+                "default_rounds": game.DEFAULT_ROUNDS,
+                "halftime_min_rounds": game.HALFTIME_MIN_ROUNDS}
     finally:
         conn.close()
 
@@ -214,7 +220,8 @@ def api_round_filters(tiers: str = "easy,medium", min_tracks: int = 25):
 @app.get("/api/round-filters/count")
 def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
                             year_from: int | None = None, year_to: int | None = None,
-                            exclude_genres: str = ""):
+                            exclude_genres: str = "",
+                            rounds: int = game.DEFAULT_ROUNDS):
     """How many tracks a specific combination leaves — the preflight for a real choice.
 
     Genres and decades are independently plausible and their INTERSECTION can still be
@@ -224,16 +231,25 @@ def api_round_filters_count(tiers: str = "easy,medium", genres: str = "",
     exclude_genres is pipe-separated like genres. It counts here as well as at start, so
     "everything except this one tag" gets the same locked-Start treatment as any other
     choice — an exclusion wide enough to empty the pool must be caught before the tap.
+
+    rounds is what the pool has to fill, and it must be the count the master actually picked:
+    a 5-round game can legitimately play a pool of 6, and judging it against 10 refuses a
+    perfectly playable short game with a tight theme. `enough` is the answer to that
+    question; `enough_for_10` is kept alongside it, unchanged and always measured against 10,
+    because it is a published key this route has always returned.
     """
     tl = [t.strip() for t in tiers.split(",") if t.strip()]
     gl = [g for g in (genres.split("|") if genres else []) if g]
     xl = [g for g in (exclude_genres.split("|") if exclude_genres else []) if g]
     if not tl:
         return Response(status_code=400, content="tiers must not be empty")
+    if rounds < 1:
+        return Response(status_code=400, content="rounds must be at least 1")
     conn = db.connect()
     try:
         n = game.pool_count(conn, tl, gl, year_from, year_to, xl)
-        return {"tracks": n, "enough_for_10": n >= 10}
+        return {"tracks": n, "rounds": rounds, "enough": n >= rounds,
+                "enough_for_10": n >= game.DEFAULT_ROUNDS}
     finally:
         conn.close()
 
@@ -847,10 +863,21 @@ async def on_new_game(s: WSSession, msg: dict) -> None:
     s.hub.host_ws = s.ws
     if ha.house_is_sleeping() and not msg.get("force"):
         raise game.GameError("house is Sleeping — start from the board to override")
+    # The count is a number off a phone, so it is checked rather than trusted — refused with a
+    # GameError the master can read, not clamped silently to something they didn't ask for. A
+    # junk value used to reach Game() directly and either build an empty game that ends on the
+    # first tap (rounds=0) or ask the picker for thousands of rounds.
+    try:
+        n_rounds = int(msg.get("rounds", game.DEFAULT_ROUNDS))
+    except (TypeError, ValueError):
+        raise game.GameError("rounds must be a number")
+    if not game.MIN_ROUNDS <= n_rounds <= game.MAX_ROUNDS:
+        raise game.GameError(
+            f"rounds must be between {game.MIN_ROUNDS} and {game.MAX_ROUNDS}")
     conn = db.connect()
     try:
         s.hub.game = game.Game(
-            conn, rounds=int(msg.get("rounds", 10)),
+            conn, rounds=n_rounds,
             tiers=msg.get("tiers") or ["easy", "medium"],
             # round filters — absent/empty means the whole library
             genres=msg.get("genres") or None,

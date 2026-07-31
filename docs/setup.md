@@ -132,8 +132,8 @@ finishes. Notes:
 
 The "start a new game" screen offers the genres and decades that actually hold enough
 quizzable tracks. Tap any number of genres and at most one decade; a live count sits under
-the pickers and **Start stays locked until the combination can fill a 10-round game**.
-Nothing to configure.
+the pickers and **Start stays locked until the combination can fill the game you asked
+for** — the round count you picked, not a fixed ten. Nothing to configure.
 
 Worth knowing:
 
@@ -178,7 +178,37 @@ Worth knowing:
 - The exclusion shows in the game label on the board and every phone ("no Blues"), because an
   exclusion-only game otherwise looks identical to an unfiltered one.
 - Nothing to configure. Same endpoint as the theme count, with an extra pipe-separated param:
-  `GET /api/round-filters/count?exclude_genres=Blues|Jazz`.
+  `GET /api/round-filters/count?exclude_genres=Blues|Jazz`. The count is judged against the
+  round count you're asking for, so pass that too — `&rounds=5` — or it defaults to 10 and a
+  narrow slice that would play a short game perfectly well reads as "not enough".
+
+## How long a game is
+
+Under the genre walls is a third one: **how many rounds?** 3, 5, 10, 15 or 20, ten by
+default — roughly 25 minutes with the reveals. Nothing to configure; the buttons come from
+the server ([game.py:31-32](../app/game.py#L31-L32)) so they can't offer a length the
+server won't play.
+
+Two things change with a short game, and the phone says both before a round is played
+rather than letting them look like faults:
+
+- **Under 6 rounds there is no half-time break.** `is_halfway`
+  ([game.py:696-698](../app/game.py#L696-L698)) needs a half worth waiting for; below that
+  a trivia interlude is an interruption. A note under the round buttons says "too short for
+  half-time trivia", because the "How to play" card promises a break and its silent absence
+  otherwise reads as a fault.
+- **Boost rounds are one per player, and at least one round is always neutral**, so a game
+  of *n* rounds has *n−1* boost slots ([game.py:315-322](../app/game.py#L315-L322)). Five
+  players in a 3-round game means two of them play without their artists' song. Who misses
+  out is decided by **shuffling** the players, not by who joined first — otherwise the
+  quickest phone would get the boost every single week. This warning appears in the
+  **lobby**, not on the idle card: nobody has joined yet when the count is picked, so the
+  lobby is the first screen where both numbers are known. The master can still abandon and
+  restart longer.
+
+"Play again" on the final scores keeps the round count and drops the theme: a group that
+just enjoyed a 5-round game wants another one, whereas the theme is what they came back to
+the idle card to choose.
 
 ## All-time top scores
 

@@ -24,6 +24,22 @@ PAYOFF_S = 12          # mirrors clips.PAYOFF_LEN — how long the reveal payoff
 PAYOFF_GRACE_S = 2
 TF_COUNT = 3           # true/false questions at half time
 TF_POINTS = 50         # enough to shake the standings, not to decide the game
+# The round counts the phone offers, and the default. Ten rounds is roughly 25 minutes with
+# the reveals; 3 is a nightcap and 20 is a party that has settled in. Held here rather than
+# in the client because the pool preflight has to agree with the buttons — a count the phone
+# offers but the server won't preflight is a Start button that locks for no stated reason.
+ROUND_CHOICES = (3, 5, 10, 15, 20)
+DEFAULT_ROUNDS = 10
+# The accepted range, wider than ROUND_CHOICES because the count arrives over the websocket
+# and anything in here is a game the server will honestly play. MIN is 1 rather than 0 (a
+# nought-round game finishes on the first tap); MAX stops a typo asking the picker for
+# thousands of rounds and stalling the lobby on a query that cannot be satisfied.
+MIN_ROUNDS = 1
+MAX_ROUNDS = 50
+# Half time needs a half worth waiting for. Below this a break is more interruption than
+# interval, so a short game deliberately has none — see is_halfway, and the phone says which
+# counts include the trivia break rather than letting its absence look like a bug.
+HALFTIME_MIN_ROUNDS = 6
 MAX_DURATION_S = int(os.environ.get("MAX_DURATION_S", "720"))  # longer = DJ mix / live jam, not quizzable
 # Too SHORT is the mirror problem and was unguarded: a 20s intro clip plus a 12s
 # payoff needs a song appreciably longer than 32s, or the "intro" IS the whole
@@ -296,8 +312,18 @@ def pick_decoys(conn, track: dict, n: int = 3,
     return picked
 
 
+def boosts_available(rounds: int) -> int:
+    """How many players can get a boost round in a game of this length.
+
+    One short of the round count, because build_rounds keeps a neutral round back. The phone
+    warns with this before Start, so the rule lives in one place instead of being re-derived
+    in quiz.js where it could drift from the loop that actually enforces it.
+    """
+    return max(0, rounds - 1)
+
+
 class Game:
-    def __init__(self, conn, rounds: int = 10, tiers: list[str] | None = None,
+    def __init__(self, conn, rounds: int = DEFAULT_ROUNDS, tiers: list[str] | None = None,
                  clock=time.monotonic, genres: list[str] | None = None,
                  year_from: int | None = None, year_to: int | None = None,
                  exclude_genres: list[str] | None = None):
@@ -363,12 +389,22 @@ class Game:
         }
 
     def build_rounds(self, conn) -> None:
-        """One boost round per player from their chosen artists, rest from the pool."""
+        """One boost round per player from their chosen artists, rest from the pool.
+
+        Not every boost fits: the cap below keeps at least one neutral round, so a short game
+        with a full lobby has fewer boost slots than players. Who misses out is decided by
+        shuffling rather than by self.players order, which is first-to-join — otherwise the
+        quickest phone reliably gets the boost and the last to arrive reliably never does,
+        every game. boosts_available() is what the phone warns with, so the master can raise
+        the round count before starting instead of finding out afterwards.
+        """
         if self.rounds:
             return
         picked: list[dict] = []
         ids: set = set()
-        for p in self.players.values():
+        contenders = list(self.players.values())
+        random.shuffle(contenders)
+        for p in contenders:
             if len(picked) >= self.n_rounds - 1:
                 break  # keep at least one neutral round
             t = pick_artist_track(conn, p.get("artists") or [], ids, filters=self.filters)
@@ -658,7 +694,8 @@ class Game:
         return self.current + 1 >= len(self.rounds)
 
     def is_halfway(self) -> bool:
-        return len(self.rounds) >= 6 and self.current + 1 == len(self.rounds) // 2
+        return (len(self.rounds) >= HALFTIME_MIN_ROUNDS
+                and self.current + 1 == len(self.rounds) // 2)
 
     def finish(self, conn) -> int:
         self.phase = "finished"
@@ -705,6 +742,12 @@ class Game:
             "host": self.host,
             "round": self.current + 1,
             "total_rounds": len(self.rounds),
+            # What the game WILL be, which in the lobby total_rounds isn't: rounds are built
+            # lazily at the first start_round, so total_rounds is 0 until then and every
+            # client showing "of 0" in the lobby would be telling the truth about the wrong
+            # thing. Kept alongside rather than folded into total_rounds, because that key
+            # means "rounds that exist" and the board's "Round 3/10" depends on it.
+            "rounds_planned": self.n_rounds,
             "players": [{"name": n, "score": p["score"], "correct": p["correct"],
                          "fastest_ms": p["fastest_ms"], "picked_artists": bool(p.get("artists")),
                          "ready": bool(p.get("ready")), "remote": bool(p.get("remote"))}
