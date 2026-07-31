@@ -91,15 +91,22 @@ global.fetch = (url) => {
   // The idle screen's round-filter pickers and their pool preflight. Resolved for real so
   // the count path (which disables Start when a combination is too narrow) is exercised
   // rather than short-circuited by a thenable that never reaches .then.
-  if (typeof url === "string" && url.startsWith("/api/round-filters/count"))
+  if (typeof url === "string" && url.startsWith("/api/round-filters/count")) {
+    // Mirrors the real route: `enough` is judged against the ROUND COUNT on the query
+    // string, not against a fixed 10, so a pool too small for a long game can still be
+    // enough for a short one. Serving a constant here would hide exactly that bug.
+    const asked = Number((url.match(/[?&]rounds=(\d+)/) || [])[1] || 10);
     return Promise.resolve({ ok: true, json: () => Promise.resolve(
-      { tracks: filterCount, enough_for_10: filterCount >= 10 }) });
+      { tracks: filterCount, rounds: asked, enough: filterCount >= asked,
+        enough_for_10: filterCount >= 10 }) });
+  }
   if (typeof url === "string" && url.startsWith("/api/round-filters"))
     return Promise.resolve({ ok: true, json: () => Promise.resolve({
       total: 6607,
       genres: [{ genre: "Pop", tracks: 5901 }, { genre: "Rock", tracks: 3928 },
                { genre: "Reggae", tracks: 56 }],
-      decades: [{ decade: 1990, tracks: 2095 }, { decade: 1960, tracks: 208 }] }) });
+      decades: [{ decade: 1990, tracks: 2095 }, { decade: 1960, tracks: 208 }],
+      round_choices: [3, 5, 10, 15, 20], default_rounds: 10, halftime_min_rounds: 6 }) });
   return { then: () => ({ then(){}, catch(){} }), catch(){} };
 };
 // Controllable clock + timers, so the payoff lock (which counts down against a
@@ -523,6 +530,110 @@ global.__remoteChecks = async () => {
   const ngClean = sent.filter(m => m.type === "new_game").pop();
   if (ngClean && ngClean.exclude_genres) {
     console.log("cleared exclusions still sent:", JSON.stringify(ngClean)); failures++; }
+
+  // -- how many rounds -----------------------------------------------------
+  // The count is a real input to the preflight, not just a number posted at Start: the same
+  // filters that can't fill 20 rounds may comfortably fill 3, and the old fixed-10 check
+  // refused those short games outright.
+  const rbox = document.getElementById("rounds-choice");
+  const rnote = document.getElementById("rounds-note");
+  countKey = ""; state = { phase: "idle", players: [] }; render(); await settle();
+  // Asserted as the whole concatenation rather than per-number: the stub's appendChild glues
+  // button labels together with no separator, so a substring test for "10" also matches the
+  // "1" of 15 followed by the "0" of 20 — it would pass against almost any wall of digits.
+  if (rbox.innerHTML !== "35✅ 101520") {
+    console.log("round-count buttons wrong (want 3 5 [10] 15 20):", rbox.innerHTML); failures++; }
+
+  // the chosen count reaches the server, and reaches the preflight query string
+  fetched.length = 0; sent.length = 0; countKey = "";
+  pickRounds(5); toggleGenre("Rock"); await settle();
+  if (!/[?&]rounds=5/.test(countUrls().pop() || "")) {
+    console.log("count not sent to the preflight:", countUrls().pop()); failures++; }
+  startGame();
+  const ngR = sent.filter(m => m.type === "new_game").pop();
+  if (!ngR || ngR.rounds !== 5) {
+    console.log("new_game did not carry the chosen count:", JSON.stringify(ngR)); failures++; }
+
+  // The regression this whole item exists for: a 6-song pool fills a 5-round game and must
+  // NOT be refused. Judged against a fixed 10 this locks Start, which is the old bug.
+  filterCount = 6; countKey = "";
+  pickRounds(5); await settle();
+  if (startBtn.disabled) {
+    console.log("Start locked on a 6-song pool that fills 5 rounds:", countTxt.textContent);
+    failures++; }
+  // ...and the same pool is still honestly refused for a 20-round game
+  countKey = "";
+  pickRounds(20); await settle();
+  if (!startBtn.disabled) { console.log("Start not locked on a 6-song 20-round game"); failures++; }
+  if (!/20 rounds/.test(countTxt.textContent)) {
+    console.log("refusal doesn't say what it couldn't fill:", countTxt.textContent); failures++; }
+  filterCount = 400; countKey = ""; pickRounds(10); await settle();
+
+  // Short games have no half time, and that has to be said rather than discovered — the
+  // absence of a break the "How to play" card promises reads as a bug otherwise.
+  countKey = ""; state = { phase: "idle", players: [] };
+  pickRounds(3); await settle();
+  if (!/half.?time/i.test(rnote.textContent)) {
+    console.log("no warning that a 3-round game skips half time:", rnote.textContent); failures++; }
+  countKey = ""; pickRounds(10); await settle();
+  if (/half.?time/i.test(rnote.textContent)) {
+    console.log("half-time warning shown for a 10-round game:", rnote.textContent); failures++; }
+
+  // The idle card must NOT try to warn about boost rounds, however tempting: nobody has
+  // joined yet on that screen, so there is nothing to count. Asserted because the first cut
+  // of this feature did exactly that and the warning was dead code in production.
+  countKey = ""; pickRounds(3); await settle();
+  if (/boost/.test(rnote.textContent)) {
+    console.log("idle card claims something about boosts before anyone has joined:",
+                rnote.textContent); failures++; }
+  countKey = ""; pickRounds(10); await settle();
+
+  // -- boost rounds that don't fit, warned in the LOBBY ---------------------
+  // One boost per player and a neutral round always kept back, so a short game with a full
+  // lobby can't give everyone theirs. It belongs here rather than on the idle card because
+  // this is the first screen where the roster and the count are both known — and after Start
+  // it's invisible, the rounds being shuffled to look alike.
+  //
+  // rounds_planned, not total_rounds: no rounds are built until the first start_round, so a
+  // lobby snapshot honestly carries total_rounds: 0.
+  const bnote = document.getElementById("lobby-boost-note");
+  const lobbyOf = (n, picks) => ({
+    phase: "lobby", host: "Alice", rounds_planned: n, total_rounds: 0,
+    players: picks.map(([name, pa]) => ({ name, score: 0, ready: true, picked_artists: pa })) });
+  joined = true;
+  state = lobbyOf(3, [["Alice", true], ["Bob", true], ["Carol", true], ["Dave", true]]);
+  render(); await settle();
+  if (bnote.hidden || !/2 of 4/.test(bnote.textContent)) {
+    console.log("no warning that boosts don't fit 4 players in 3 rounds:", bnote.textContent);
+    failures++; }
+  state = lobbyOf(20, [["Alice", true], ["Bob", true], ["Carol", true], ["Dave", true]]);
+  render(); await settle();
+  if (!bnote.hidden) {
+    console.log("boost warning shown when all four fit in 20 rounds:", bnote.textContent);
+    failures++; }
+  // a player who picked no artists has no boost round to miss, so mustn't trigger the warning
+  state = lobbyOf(3, [["Alice", true], ["Bob", false], ["Carol", false]]);
+  render(); await settle();
+  if (!bnote.hidden) {
+    console.log("boost warning counted players who picked no artists:", bnote.textContent);
+    failures++; }
+  // and a lobby that hasn't been told the count yet says nothing rather than "of 0"
+  state = lobbyOf(0, [["Alice", true], ["Bob", true]]);
+  render(); await settle();
+  if (!bnote.hidden) {
+    console.log("boost warning guessed at a count it wasn't given:", bnote.textContent);
+    failures++; }
+  joined = false; state = { phase: "idle", players: [] }; countKey = ""; pickRounds(10);
+  render(); await settle();
+
+  // "Play again" carries the length forward but not the theme — see playAgain().
+  sent.length = 0; pickRounds(5); playAgain();
+  const again = sent.filter(m => m.type === "new_game").pop();
+  if (!again || again.rounds !== 5) {
+    console.log("play again lost the round count:", JSON.stringify(again)); failures++; }
+  if (again && (again.genres || again.exclude_genres || again.year_from)) {
+    console.log("play again carried the old filters:", JSON.stringify(again)); failures++; }
+  pickRounds(10); countKey = "";
 
   // and a themed game says so all game long, on every screen
   state = { ...${JSON.stringify(snapshots[2])}, filter_label: "Rock · the 1990s" };

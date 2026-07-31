@@ -347,6 +347,74 @@ def test_new_game_carries_the_round_filters_including_the_exclusion(hub):
     assert hub.game.filter_label() == ""
 
 
+def _seed_pool(n=30, tier="easy"):
+    """Fill the handler's OWN db (pinned by `quiet`) so new_game has a pool to preflight.
+
+    The `hub` fixture's game lives in a separate temp db, and on_new_game calls db.connect()
+    for itself — without this every new_game fails on the pool check instead of on the rule
+    under test.
+    """
+    seeded = main.db.connect()
+    for i in range(n):
+        seeded.execute(
+            "INSERT INTO tracks(id,title,artist,album,year,duration,tier,clipped_at,"
+            "global_listeners,active) VALUES(?,?,?,?,?,?,?,?,?,1)",
+            (f"n{i}", f"Song {i}", f"Band {i}", "Album", 1995, 200, tier,
+             "2026-07-06T00:00:00", 5000))
+    seeded.commit()
+    seeded.close()
+
+
+def test_new_game_builds_the_number_of_rounds_the_master_picked(hub):
+    """The count crosses the socket as a plain payload key, and it was hardcoded at 10 on the
+    far side. A handler that dropped it would build ten rounds and look entirely healthy."""
+    _seed_pool()
+    hub.game.phase = "finished"
+    s = session(hub, "Alice")
+    send(s, type="new_game", rounds=5)
+    assert s.ws.errors() == [], s.ws.errors()
+    assert hub.game.n_rounds == 5
+    hub.game.join("Alice")
+    conn = main.db.connect()
+    try:
+        hub.game.build_rounds(conn)
+    finally:
+        conn.close()
+    assert len(hub.game.rounds) == 5
+    assert hub.game.snapshot()["total_rounds"] == 5
+    # ...and no count at all is still the ten-round game every existing phone asks for
+    hub.game.phase = "finished"
+    send(session(hub, "Alice"), type="new_game")
+    assert hub.game.n_rounds == game.DEFAULT_ROUNDS
+
+
+def test_a_junk_round_count_is_refused_and_leaves_no_game_started(hub):
+    """The count is a number off a phone, so it's checked rather than trusted. Unclamped, 0
+    reached Game() as a game that finishes on the first tap, 51 asked the picker for rounds
+    the library cannot fill, and a non-numeric value raised ValueError straight out of the
+    handler — which kills the socket instead of telling the phone why.
+
+    Each case must also leave the finished game in place: a rejected new_game that had already
+    replaced hub.game would strand the room with a half-built one.
+    """
+    _seed_pool()
+    for bad, want in ((0, "between"), (51, "between"), (game.MAX_ROUNDS + 1, "between"),
+                      ("lots", "number"), (None, "number"), ([5], "number")):
+        hub.game.phase = "finished"
+        before = hub.game
+        s = session(hub, "Alice")
+        send(s, type="new_game", rounds=bad)
+        assert s.ws.errors() and want in s.ws.errors()[0], f"rounds={bad!r}: {s.ws.sent}"
+        assert hub.game is before, f"rounds={bad!r} started a game anyway"
+    # the edges of the accepted range are not junk
+    for good in (game.MIN_ROUNDS, game.DEFAULT_ROUNDS):
+        hub.game.phase = "finished"
+        s = session(hub, "Alice")
+        send(s, type="new_game", rounds=good)
+        assert s.ws.errors() == [], f"rounds={good} refused: {s.ws.errors()}"
+        assert hub.game.n_rounds == good
+
+
 def test_a_sleeping_house_refuses_a_new_game_unless_forced(hub, monkeypatch):
     monkeypatch.setattr(main.ha, "house_is_sleeping", lambda: True)
     hub.game.phase = "finished"

@@ -88,13 +88,19 @@ subscriptions.
    the song plays. The next-song button holds for two seconds so nobody skips the
    answer before it's read, then it's live — it shows how much song is left, and
    the game master decides whether to let it run or press on.
-6. At the midpoint, the game breaks for a **half-time show**: every player's phone gets a music
+6. At the midpoint of a game of 6 rounds or more, it breaks for a **half-time show**:
+   every player's phone gets a music
    fact to read out to the table, then three quick **true-or-false** questions —
    answered on the phones, question up on the TV, +50 points each on the main
    scoreboard, auto-revealed once everyone's in.
 7. Rubbish clip (applause intro, ambient noise)? The game master's reveal screen has
    a **🚫 bad clip** link — two taps to confirm — that bans the track forever.
-8. Ten rounds a game, a 🎺 fanfare on the final scores, persistent all-time
+8. **How many rounds is the master's choice** — 3, 5, 10, 15 or 20, picked on the
+   "start a new game" card before anyone joins, ten by default (roughly 25 minutes
+   with the reveals). A short game gives up two things, and the phone says so rather
+   than letting either look like a bug: under 6 rounds there's no half-time break, and
+   a lobby bigger than the game is long means not everyone's boost round fits.
+9. Then a 🎺 fanfare on the final scores, persistent all-time
    leaderboard — **🏆 top scores show on the phone too**, on the join screen (who
    you're chasing) and under the final scores (what tonight changed), with your own
    row highlighted. Totalled across every game ever played and kept in the database,
