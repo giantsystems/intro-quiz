@@ -1597,6 +1597,8 @@ def test_the_picker_is_told_which_counts_to_offer_and_which_include_half_time(mo
         assert game.DEFAULT_ROUNDS in body["round_choices"], "the default must be pickable"
         assert all(game.MIN_ROUNDS <= n <= game.MAX_ROUNDS for n in body["round_choices"]), \
             "a button the new_game handler would refuse"
+        # pinned, not just range-checked: a marathon game is a real, tappable choice
+        assert 30 in body["round_choices"] and 40 in body["round_choices"]
     finally:
         conn.close(); os.unlink(p)
 

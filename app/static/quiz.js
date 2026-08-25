@@ -445,7 +445,7 @@ function loadFilterOpts() {
   filterOpts = {genres: [], decades: []};   // set first: a slow fetch must not queue more
   fetch("/api/round-filters").then(r => r.json()).then(d => {
     filterOpts = {genres: d.genres || [], decades: d.decades || [],
-                  roundChoices: d.round_choices || [3, 5, 10, 15, 20],
+                  roundChoices: d.round_choices || [3, 5, 10, 15, 20, 30, 40],
                   halftimeMin: d.halftime_min_rounds || 6};
     // Only before the first tap: the fetch can land after the master has already chosen,
     // and snapping the count back to the default under their finger would be worse than

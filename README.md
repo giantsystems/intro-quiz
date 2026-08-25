@@ -95,7 +95,7 @@ subscriptions.
    scoreboard, auto-revealed once everyone's in.
 7. Rubbish clip (applause intro, ambient noise)? The game master's reveal screen has
    a **🚫 bad clip** link — two taps to confirm — that bans the track forever.
-8. **How many rounds is the master's choice** — 3, 5, 10, 15 or 20, picked on the
+8. **How many rounds is the master's choice** — 3, 5, 10, 15, 20, 30 or 40, picked on the
    "start a new game" card before anyone joins, ten by default (roughly 25 minutes
    with the reveals). A short game gives up two things, and the phone says so rather
    than letting either look like a bug: under 6 rounds there's no half-time break, and

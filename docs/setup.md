@@ -184,9 +184,9 @@ Worth knowing:
 
 ## How long a game is
 
-Under the genre walls is a third one: **how many rounds?** 3, 5, 10, 15 or 20, ten by
-default — roughly 25 minutes with the reveals. Nothing to configure; the buttons come from
-the server ([game.py:31-32](../app/game.py#L31-L32)) so they can't offer a length the
+Under the genre walls is a third one: **how many rounds?** 3, 5, 10, 15, 20, 30 or 40, ten
+by default — roughly 25 minutes with the reveals. Nothing to configure; the buttons come
+from the server ([game.py:31-32](../app/game.py#L31-L32)) so they can't offer a length the
 server won't play.
 
 Two things change with a short game, and the phone says both before a round is played

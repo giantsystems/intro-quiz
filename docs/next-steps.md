@@ -429,7 +429,7 @@ fill 20 may fill 5, so a shorter game has to re-ask rather than inherit the lock
 
 Three decisions, and the reasoning behind each:
 
-- **Preset buttons, not a stepper or a number field.** 3 / 5 / 10 / 15 / 20 is one tap and
+- **Preset buttons, not a stepper or a number field.** 3 / 5 / 10 / 15 / 20 / 30 / 40 is one tap and
   no keyboard, and it reuses the wall idiom the genre and decade pickers already established
   on the same card — a stepper means five taps to get from 10 to 15, and a free input means
   a phone keyboard covering the card plus a validation story for "seven hundred". The cost

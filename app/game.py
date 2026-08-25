@@ -28,7 +28,7 @@ TF_POINTS = 50         # enough to shake the standings, not to decide the game
 # the reveals; 3 is a nightcap and 20 is a party that has settled in. Held here rather than
 # in the client because the pool preflight has to agree with the buttons — a count the phone
 # offers but the server won't preflight is a Start button that locks for no stated reason.
-ROUND_CHOICES = (3, 5, 10, 15, 20)
+ROUND_CHOICES = (3, 5, 10, 15, 20, 30, 40)
 DEFAULT_ROUNDS = 10
 # The accepted range, wider than ROUND_CHOICES because the count arrives over the websocket
 # and anything in here is a game the server will honestly play. MIN is 1 rather than 0 (a
