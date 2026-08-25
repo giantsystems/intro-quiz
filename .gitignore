@@ -1,6 +1,8 @@
 # runtime secrets + data — never tracked (repo will be public)
 .env
 .env.local
+# agent-only pickup notes: deploy host/path, admin token hints — never tracked
+CLAUDE.local.md
 /data/
 # local dev scratch (make seed / make dev) — see .env.local.example
 /devdata/
