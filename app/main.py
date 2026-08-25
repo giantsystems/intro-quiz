@@ -499,6 +499,8 @@ async def api_bootstrap():
 # ---------------------------------------------------------------------------
 
 class Hub:
+    SEND_TIMEOUT_S = 5.0  # see send_to()
+
     def __init__(self):
         self.game: game.Game | None = None
         self.sockets: list[WebSocket] = []
@@ -573,6 +575,21 @@ class Hub:
                 asyncio.create_task(self.ungroup_speakers())
         loop.call_later(delay, _if_still_idle)
 
+    async def send_to(self, ws: WebSocket, payload: dict) -> bool:
+        """Send with a timeout. Every call site runs under hub.lock, so a phone
+        that dropped off wifi without a clean close — normal on mobile — would
+        otherwise hang the send forever and, because the lock is held, freeze
+        dispatch for every other player until the OS eventually notices. Dropped
+        on timeout the same as any other dead socket."""
+        try:
+            await asyncio.wait_for(ws.send_json(payload), timeout=self.SEND_TIMEOUT_S)
+            return True
+        except Exception:  # noqa: BLE001 — TimeoutError or a closed-socket send
+            if ws in self.sockets:
+                self.sockets.remove(ws)
+            self.boards.discard(ws)
+            return False
+
     async def broadcast(self):
         snap = self.game.snapshot() if self.game else {"phase": "idle"}
         snap["type"] = "state"
@@ -580,14 +597,8 @@ class Hub:
         snap["display"] = self.display or "none"
         snap["next_host"] = self.next_host  # shown on the finished screen
         snap["game_no"] = self.games_started
-        dead = []
-        for ws in self.sockets:
-            try:
-                await ws.send_json(snap)
-            except Exception:  # noqa: BLE001
-                dead.append(ws)
-        for ws in dead:
-            self.sockets.remove(ws)
+        for ws in list(self.sockets):  # send_to() mutates self.sockets on failure
+            await self.send_to(ws, snap)
 
     def cancel_deadline(self):
         if self.deadline_task and not self.deadline_task.done():
@@ -817,7 +828,7 @@ def handler(kind: str, *, counts_as_activity: bool = True, requires_game: bool =
 async def on_ping(s: WSSession, msg: dict) -> None:
     """Liveness probe only (#50) — deliberately quiet, or an idle phone left on
     the page keeps a stale game alive."""
-    await s.ws.send_json({"type": "pong"})
+    await s.hub.send_to(s.ws, {"type": "pong"})
 
 
 @handler("set_display", counts_as_activity=False)
@@ -1071,7 +1082,7 @@ async def dispatch(s: WSSession, msg: dict) -> None:
             raise game.GameError("no game — start one first")
         await fn(s, msg)
     except game.GameError as e:
-        await s.ws.send_json({"type": "error", "message": str(e)})
+        await s.hub.send_to(s.ws, {"type": "error", "message": str(e)})
 
 
 @app.websocket("/ws")
@@ -1081,9 +1092,9 @@ async def ws_endpoint(ws: WebSocket):
     s = WSSession(ws, hub)
     try:
         snap = hub.game.snapshot() if hub.game else {"phase": "idle"}
-        await ws.send_json({**snap, "type": "state",
-                            "displays": board_cast.display_names(),
-                            "display": hub.display or "none"})
+        await hub.send_to(ws, {**snap, "type": "state",
+                               "displays": board_cast.display_names(),
+                               "display": hub.display or "none"})
         while True:
             msg = await ws.receive_json()
             async with hub.lock:

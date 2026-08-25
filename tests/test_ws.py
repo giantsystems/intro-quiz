@@ -614,3 +614,20 @@ def test_a_dead_socket_is_dropped_and_does_not_block_the_others(hub):
     send(session(hub, "Alice"), type="ready")
     assert live.kinds() == ["state"]
     assert dead not in hub.sockets
+
+
+def test_a_hung_socket_times_out_and_does_not_block_the_others(hub):
+    """A phone that dropped off wifi without a clean close never raises — it
+    just never answers. Every dispatch() in the room runs inside hub.lock, and
+    broadcast() runs inside that too, so a send with no timeout would freeze
+    the whole game for everyone, not just the one dead phone."""
+    class Hung(FakeWS):
+        async def send_json(self, payload):
+            await asyncio.sleep(1)  # bounded: the test must finish either way
+
+    hub.SEND_TIMEOUT_S = 0.05
+    hung, live = Hung(), FakeWS()
+    hub.sockets = [hung, live]
+    send(session(hub, "Alice"), type="ready")
+    assert live.kinds() == ["state"]
+    assert hung not in hub.sockets
