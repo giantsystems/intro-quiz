@@ -388,6 +388,27 @@ def test_new_game_builds_the_number_of_rounds_the_master_picked(hub):
     assert hub.game.n_rounds == game.DEFAULT_ROUNDS
 
 
+def test_a_long_game_actually_builds_that_many_rounds(hub):
+    """30 and 40 are ROUND_CHOICES too, not just accepted range filler — the widest picks
+    a phone can actually tap. Proved the same way as the 5-round case: a handler that read
+    the count but build_rounds() that quietly capped it would still look healthy."""
+    _seed_pool(n=40)
+    for want in (30, 40):
+        hub.game.phase = "finished"
+        s = session(hub, "Alice")
+        send(s, type="new_game", rounds=want)
+        assert s.ws.errors() == [], s.ws.errors()
+        assert hub.game.n_rounds == want
+        hub.game.join("Alice")
+        conn = main.db.connect()
+        try:
+            hub.game.build_rounds(conn)
+        finally:
+            conn.close()
+        assert len(hub.game.rounds) == want
+        assert hub.game.snapshot()["total_rounds"] == want
+
+
 def test_a_junk_round_count_is_refused_and_leaves_no_game_started(hub):
     """The count is a number off a phone, so it's checked rather than trusted. Unclamped, 0
     reached Game() as a game that finishes on the first tap, 51 asked the picker for rounds

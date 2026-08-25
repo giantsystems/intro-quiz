@@ -106,7 +106,7 @@ global.fetch = (url) => {
       genres: [{ genre: "Pop", tracks: 5901 }, { genre: "Rock", tracks: 3928 },
                { genre: "Reggae", tracks: 56 }],
       decades: [{ decade: 1990, tracks: 2095 }, { decade: 1960, tracks: 208 }],
-      round_choices: [3, 5, 10, 15, 20], default_rounds: 10, halftime_min_rounds: 6 }) });
+      round_choices: [3, 5, 10, 15, 20, 30, 40], default_rounds: 10, halftime_min_rounds: 6 }) });
   return { then: () => ({ then(){}, catch(){} }), catch(){} };
 };
 // Controllable clock + timers, so the payoff lock (which counts down against a
@@ -541,8 +541,8 @@ global.__remoteChecks = async () => {
   // Asserted as the whole concatenation rather than per-number: the stub's appendChild glues
   // button labels together with no separator, so a substring test for "10" also matches the
   // "1" of 15 followed by the "0" of 20 — it would pass against almost any wall of digits.
-  if (rbox.innerHTML !== "35✅ 101520") {
-    console.log("round-count buttons wrong (want 3 5 [10] 15 20):", rbox.innerHTML); failures++; }
+  if (rbox.innerHTML !== "35✅ 1015203040") {
+    console.log("round-count buttons wrong (want 3 5 [10] 15 20 30 40):", rbox.innerHTML); failures++; }
 
   // the chosen count reaches the server, and reaches the preflight query string
   fetched.length = 0; sent.length = 0; countKey = "";
