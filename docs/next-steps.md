@@ -12,9 +12,8 @@ compete, even though several are dearer.
 Nothing here is committed to. Each item says what's actually wrong, why it's worth
 doing, and what it costs; if a better idea turns up, do that instead.
 
-**Cheap wins, if you want a short list:** item 13 is a couple of hours because the server
-already takes the parameter, and item 8 may be mostly layout. Items 4 and 11 have hard
-prerequisites, stated in place.
+**Cheap wins, if you want a short list:** item 8 may be mostly layout. Items 4 and 11 have
+hard prerequisites, stated in place.
 
 ## Where things stand
 
@@ -22,6 +21,10 @@ prerequisites, stated in place.
 honest job progress, case-folded player names, and genre exclusion. v1.33.0 before it
 brought genre + decade round filters, a non-empty `easy` tier, cross-game track history,
 abortable admin jobs with an honest 409, and the websocket handler table.
+
+**Item 13 (choose the number of rounds) is done on `master` and not yet released** — the
+round-count wall, the preflight measured against the chosen count, and the two warnings a
+short game now needs. Details in item 13 below.
 
 - **Tests:** 259 python + two node smokes (`make test`, `make test-js`). All green.
   There is no CI — see [fork-changes.md](fork-changes.md#no-dependabot-either).
@@ -87,7 +90,7 @@ score in two before the all-time query ever saw it.
 Two decisions worth knowing about, both deliberate:
 
 - **Display is Title Case, always** — one function, `display_name`
-  ([game.py:55](../app/game.py#L55)). It is applied over the grouped rows because
+  ([game.py:71](../app/game.py#L71)). It is applied over the grouped rows because
   `GROUP BY ... COLLATE NOCASE` returns an *arbitrary* member spelling for the selected
   column, so without it the name on the board depended on which row SQLite happened to
   pick. The accepted cost is that it flattens `JB` to `Jb` and `McDonald` to `Mcdonald`.
@@ -177,7 +180,8 @@ mid-game restarts actually happen.
 
 Asked for on 2026-07-30, listed in the order they were requested rather than by cost.
 The cost estimates and the notes on what's already in place were checked against the code
-the same day. Items 6, 8 and 13 are cheap; item 11 is explicitly a maybe-never.
+the same day. Items 6 and 8 are cheap; item 13 was, and is now done. Item 11 is explicitly
+a maybe-never.
 
 ## 6. Exclude genres from a game
 
@@ -394,43 +398,83 @@ in miniature for however long it sat there.
 `make test-js` — the two node smokes render every phase, so a broken tag fails there rather
 than on the night.
 
-## 13. Choose the number of rounds
+## 13. Choose the number of rounds — **DONE**
 
-**Cost:** a couple of hours for the control, plus the decisions below.
+Ten was never a rule, just the only number the phone could send: `Game.__init__` had taken
+`rounds` all along ([game.py:326](../app/game.py#L326)) and `new_game` had always read it,
+but `startGame` hardcoded `rounds: 10` and the Play again button hardcoded it a second time.
+Both are gone. The idle card now has a **How many rounds?** wall
+([index.html:50-52](../app/static/index.html#L50-L52)) rendered by `renderRounds`
+([quiz.js:524-537](../app/static/quiz.js#L524-L537)).
 
-**The server already supports this.** `Game.__init__` takes `rounds`
-([game.py:305](../app/game.py#L305)) and the `new_game` handler already reads it
-([main.py:853](../app/main.py#L853)) — it's the phone that hardcodes the value:
+The choices are served, not hardcoded in the client: `ROUND_CHOICES` and `DEFAULT_ROUNDS`
+([game.py:31-32](../app/game.py#L31-L32)) come back from `/api/round-filters`
+([main.py:211-215](../app/main.py#L211-L215)) alongside `halftime_min_rounds`, because a
+count the buttons offer but the server's preflight refuses is a Start button that locks for
+no stated reason. The count arriving over the websocket is clamped rather than trusted —
+`MIN_ROUNDS` / `MAX_ROUNDS` ([game.py:37-38](../app/game.py#L37-L38)), checked at
+[main.py:869-875](../app/main.py#L869-L875) — because `rounds: 0` finishes on the first tap
+and `rounds: 5000` stalls the lobby in the picker.
 
-```js
-const msg = {type: "new_game", rounds: 10};   // quiz.js:531
-```
+**The preflight bug is fixed, and that was the real defect here.**
+`/api/round-filters/count` measured every filter combination against 10, so a theme with 6
+playable tracks locked Start even for a 5-round game that would have played perfectly. It
+now takes `rounds=` and answers `enough` against that count
+([main.py:220-252](../app/main.py#L220-L252)). `enough_for_10` is still returned, unchanged
+and still always against 10, because it is a published key; the phone prefers `enough` and
+falls back to it ([quiz.js:595](../app/static/quiz.js#L595)) so a stale cached script keeps
+working instead of locking Start on an `undefined`. The round count is part of the fetch
+dedupe key ([quiz.js:577-580](../app/static/quiz.js#L577-L580)) — the filters that can't
+fill 20 may fill 5, so a shorter game has to re-ask rather than inherit the locked Start.
 
-So the work is a control on the idle card next to the theme and exclusion walls, and
-`total_rounds` is already in the snapshot and already rendered
-([quiz.js:612](../app/static/quiz.js#L612)), so the board and phone follow automatically.
+Three decisions, and the reasoning behind each:
 
-Three things need deciding, and they're the actual work:
+- **Preset buttons, not a stepper or a number field.** 3 / 5 / 10 / 15 / 20 is one tap and
+  no keyboard, and it reuses the wall idiom the genre and decade pickers already established
+  on the same card — a stepper means five taps to get from 10 to 15, and a free input means
+  a phone keyboard covering the card plus a validation story for "seven hundred". The cost
+  is that 7 rounds is not offerable without a code change; that was accepted. The wall does
+  differ from its neighbours in one way, deliberately: tapping the chosen count again leaves
+  it alone rather than toggling off ([quiz.js:486-491](../app/static/quiz.js#L486-L491)),
+  because a game has to be *some* length.
+- **The 6-round half-time floor stayed where it was.** It was a bare `6` inside `is_halfway`
+  and is now `HALFTIME_MIN_ROUNDS` ([game.py:42](../app/game.py#L42), read at
+  [game.py:696-698](../app/game.py#L696-L698)), but the number didn't move. Lowering it was
+  considered and rejected: a facts-and-three-questions break in a 3-round game is more
+  interruption than interval, and it would land after round one. So a short game has no
+  trivia, on purpose — and the fix for the surprise is the UI saying so ("too short for
+  half-time trivia", `roundsNote` at
+  [quiz.js:500-503](../app/static/quiz.js#L500-L503)) rather than the absence looking like
+  a bug the master should report. The "How to play" card promises a break, which is what
+  makes silence here actively misleading rather than merely quiet.
+- **Boosts are randomised when they don't all fit.** `build_rounds` keeps at least one
+  neutral round, so a game of *n* rounds has *n−1* boost slots —
+  `boosts_available()` ([game.py:315-322](../app/game.py#L315-L322)), which exists so the
+  phone's warning and the loop that enforces the cap can't drift apart. Five players in a
+  3-round game means two go without. The previous behaviour wasn't neutral about who: it
+  walked `self.players`, which is insertion order, so the quickest phone to join reliably
+  got a boost and the last to arrive reliably didn't, every game. `build_rounds` now
+  shuffles the contenders first ([game.py:401-417](../app/game.py#L401-L417)). The warning
+  carries the numbers ("only 2 of 5 boost rounds fit in 3 rounds") and lives in the
+  **lobby**, not on the idle card — `lobbyBoostNote`
+  ([quiz.js:512-522](../app/static/quiz.js#L512-L522)) — because on the idle card
+  `state.players` is empty every time: players only arrive after `new_game`. That needed a
+  new snapshot key, `rounds_planned` ([game.py:750](../app/game.py#L750)), since rounds are
+  built lazily at the first `start_round` and `total_rounds` is 0 for the whole lobby. The
+  master can still abandon and restart longer, which is the only fix available.
 
-- **Half time only exists at 6+ rounds.** `is_halfway` is
-  `len(self.rounds) >= 6 and self.current + 1 == len(self.rounds) // 2`
-  ([game.py:661](../app/game.py#L661)), so a 4-round game silently has no trivia break.
-  That's defensible — but say so in the UI rather than letting it surprise the master.
-- **The pool preflight assumes 10.** There's an `enough_for_10` check that refuses a filter
-  selection too narrow to fill a game; a 5-round game could legitimately play a pool that
-  currently gets refused. Make the preflight use the chosen count, or a short game with a
-  tight theme will be blocked for no reason.
-- **Boost rounds are one per player** ([game.py:366](../app/game.py#L366)). Six players in a
-  4-round game means the boost rounds don't fit. Decide what gives — fewer boosts, or a
-  floor on the round count relative to the lobby size.
+Play again carries the round count forward and deliberately not the filters
+([quiz.js:612-619](../app/static/quiz.js#L612-L619)): a group that just enjoyed a 5-round
+game wants another 5-round game, whereas the theme is what they came back to the idle card
+to choose — and the finished screen has no filter wall to preflight from, so sending no
+filters keeps it to the one case that never needs checking.
 
-**Why it's worth doing:** ten rounds is roughly 25 minutes with the reveals. A short game
-is the difference between "one more?" and "not tonight", and a long one suits a party that's
-settled in. The upstream constant is a guess about your evening.
-
-**Test it by** playing a 3-round and a 20-round game: assert `total_rounds` is honoured, that
-half time fires only where it should, and that a narrow filter which fills a short game is
-no longer refused.
+**What a test has to show,** beyond `total_rounds` being honoured at 3 and at 20: that half
+time fires at 6 rounds and not at 5; that a pool of 6 tracks is accepted for a 5-round game
+and refused for a 10-round one; that a lobby larger than `boosts_available()` still builds a
+full game with a neutral round in it; and that a junk `rounds` value off a phone comes back
+as a `GameError` rather than a built game. The node smokes render the idle card, so the
+round wall and its warning line are covered by `make test-js` as well.
 
 ---
 

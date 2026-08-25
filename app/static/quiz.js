@@ -434,12 +434,23 @@ let pickedGenres = new Set();
 let bannedGenres = new Set();   // "everything EXCEPT these" — see toggleBannedGenre
 let pickedDecade = null;        // the decade's first year, e.g. 1990
 let countKey = "";              // dedupes the count fetch across repeated renders
+// How long the next game is. Seeded from the server's default and re-seeded when
+// /api/round-filters answers, so the button list and the count the server preflights against
+// are the same number — see ROUND_CHOICES in game.py.
+let pickedRounds = 10;
+let roundsTouched = false;      // don't overwrite the master's choice when the fetch lands
 
 function loadFilterOpts() {
   if (filterOpts) return;
   filterOpts = {genres: [], decades: []};   // set first: a slow fetch must not queue more
   fetch("/api/round-filters").then(r => r.json()).then(d => {
-    filterOpts = {genres: d.genres || [], decades: d.decades || []};
+    filterOpts = {genres: d.genres || [], decades: d.decades || [],
+                  roundChoices: d.round_choices || [3, 5, 10, 15, 20],
+                  halftimeMin: d.halftime_min_rounds || 6};
+    // Only before the first tap: the fetch can land after the master has already chosen,
+    // and snapping the count back to the default under their finger would be worse than
+    // briefly showing a default that turns out to match anyway.
+    if (!roundsTouched && d.default_rounds) pickedRounds = d.default_rounds;
     render();
   }).catch(() => { filterOpts = null; });   // let the next render retry
 }
@@ -468,6 +479,61 @@ function toggleBannedGenre(g) {
 function toggleDecade(d) {
   pickedDecade = pickedDecade === d ? null : d;   // one decade at a time
   render();
+}
+
+// Unlike the genre and decade walls this never clears to "no choice" — a game has to be some
+// length, so tapping the chosen count again leaves it alone rather than toggling it off.
+function pickRounds(n) {
+  pickedRounds = n;
+  roundsTouched = true;
+  countKey = "";   // the pool is judged against the count, so the preflight must re-ask
+  render();
+}
+
+// What a short game gives up, said on the idle card rather than discovered mid-game: below
+// halftimeMin there is no trivia break at all, and the "How to play" card promises one, so its
+// silent absence reads as a bug.
+//
+// The BOOST shortfall can't be warned about here, tempting as it looks: nobody has joined yet.
+// Players arrive in the lobby, which only exists after new_game, so state.players is empty on
+// this screen every time. That warning lives in lobbyBoostNote() instead.
+function roundsNote() {
+  const halfMin = (filterOpts && filterOpts.halftimeMin) || 6;
+  return pickedRounds < halfMin ? "⚠️ too short for half-time trivia" : "";
+}
+
+// The boost shortfall, warned about in the lobby because that is the first screen where both
+// numbers are known — the round count is fixed by then, but the master can still abandon and
+// restart longer, and a player can still skip their artists.
+//
+// Mirrors boosts_available() in game.py: one short of the count, because build_rounds always
+// keeps a neutral round back. Only players who actually picked artists have a boost to miss,
+// and after Start it's invisible — the rounds are shuffled to be indistinguishable.
+function lobbyBoostNote() {
+  // rounds_planned, not total_rounds: in the lobby no rounds have been built yet, so
+  // total_rounds is 0 — see snapshot() in game.py.
+  const total = state.rounds_planned || 0;
+  const boosts = Math.max(0, total - 1);
+  const hopefuls = (state.players || []).filter(p => p.picked_artists).length;
+  if (!total || hopefuls <= boosts) return "";
+  return boosts === 0
+    ? "⚠️ no room for boost rounds in a " + total + "-round game"
+    : "⚠️ only " + boosts + " of " + hopefuls + " boost rounds fit in " + total + " rounds";
+}
+
+function renderRounds() {
+  const rbox = document.getElementById("rounds-choice");
+  const note = document.getElementById("rounds-note");
+  if (!rbox) return;   // older cached index.html
+  if (state.phase !== "idle") { rbox.innerHTML = ""; if (note) note.textContent = ""; return; }
+  rbox.innerHTML = "";
+  for (const n of (filterOpts && filterOpts.roundChoices) || []) {
+    const b = document.createElement("button");
+    b.textContent = (pickedRounds === n ? "✅ " : "") + n;
+    b.onclick = () => pickRounds(n);
+    rbox.appendChild(b);
+  }
+  if (note) note.textContent = roundsNote();
 }
 
 function renderFilters() {
@@ -508,8 +574,10 @@ function renderFilters() {
   // totals — and the Start button locks when it can't fill a game, instead of letting the
   // server refuse at the moment of the tap.
   const start = document.getElementById("start-game");
+  // The count is part of the key: the same filters that can't fill 20 rounds may fill 5, so a
+  // shorter game has to re-ask rather than inherit the longer game's locked Start.
   const key = [...pickedGenres].sort().join("|") + "/" + pickedDecade
-            + "/!" + [...bannedGenres].sort().join("|");
+            + "/!" + [...bannedGenres].sort().join("|") + "/#" + pickedRounds;
   if (!pickedGenres.size && !bannedGenres.size && pickedDecade === null) {
     out.textContent = ""; start.disabled = false; countKey = ""; return;
   }
@@ -517,26 +585,42 @@ function renderFilters() {
   countKey = key;
   const qs = "genres=" + encodeURIComponent([...pickedGenres].join("|"))
            + "&exclude_genres=" + encodeURIComponent([...bannedGenres].join("|"))
+           + "&rounds=" + pickedRounds
            + (pickedDecade === null ? "" : "&year_from=" + pickedDecade + "&year_to=" + (pickedDecade + 9));
   fetch("/api/round-filters/count?" + qs).then(r => r.json()).then(d => {
     if (key !== countKey) return;   // a newer choice landed first
-    out.textContent = d.enough_for_10
+    // `enough` is measured against the chosen count; enough_for_10 is the old always-10 key,
+    // still served for anything else reading this route. Falling back to it keeps a stale
+    // cached script working rather than locking Start on an undefined.
+    const ok = d.enough === undefined ? d.enough_for_10 : d.enough;
+    out.textContent = ok
       ? d.tracks + " songs to choose from"
-      : "⚠️ only " + d.tracks + " songs — pick something wider";
-    start.disabled = !d.enough_for_10;
+      : "⚠️ only " + d.tracks + " songs for " + pickedRounds
+        + " rounds — pick something wider, or a shorter game";
+    start.disabled = !ok;
   }).catch(() => { countKey = ""; });
 }
 
 function startGame() {
-  const msg = {type: "new_game", rounds: 10};
+  const msg = {type: "new_game", rounds: pickedRounds};
   if (pickedGenres.size) msg.genres = [...pickedGenres];
   if (bannedGenres.size) msg.exclude_genres = [...bannedGenres];
   if (pickedDecade !== null) { msg.year_from = pickedDecade; msg.year_to = pickedDecade + 9; }
   send(msg);
 }
 
+// "Play again" from the final scores. Deliberately carries the round count forward and NOT
+// the filters: a group that just enjoyed a 5-round game wants another 5-round game, whereas
+// the theme is the thing they came to the idle card to choose. It also can't preflight from
+// here — there is no filter wall on the finished screen — which is the other reason to send
+// no filters: the unfiltered pool is the one case that never needs checking.
+function playAgain() {
+  send({type: "new_game", rounds: pickedRounds});
+}
+
 function render() {
   renderDisplays();
+  renderRounds();   // before renderFilters: the count is what the preflight is judged against
   renderFilters();
   renderWhere();
   renderAlltime();  // up here with the others: render() returns early on idle/join
@@ -597,6 +681,10 @@ function render() {
         : (hostOnly ? "▶ Start round 1" : `▶ Start (take over from ${state.host})`);
       document.getElementById("lobby-wait").hidden = hostOnly || !hostJoined;
       if (state.host) document.getElementById("lobby-wait").textContent = `${state.host} starts the game 🎤`;
+      // Shown to everyone, not just the master: it's the players who lose the boost round,
+      // and one of them offering to skip their artists is a perfectly good resolution.
+      const bn = document.getElementById("lobby-boost-note");
+      if (bn) { bn.textContent = lobbyBoostNote(); bn.hidden = !bn.textContent; }
       show("v-lobby");
     }
     if (!joined) return;

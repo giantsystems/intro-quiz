@@ -1495,3 +1495,260 @@ def test_one_game_writes_one_results_row_per_person_however_they_spelled_it():
         assert game.all_time_leaderboard(conn)[0]["games"] == 1
     finally:
         conn.close(); os.unlink(p)
+
+
+# -- how many rounds (the master's choice, was hardcoded at 10) --------------
+
+def test_a_pool_too_small_for_ten_rounds_still_plays_a_short_game(monkeypatch):
+    """THE bug the round picker exists to fix: the preflight judged every pool against 10, so
+    a tight theme holding six songs locked Start even though a 5-round game plays it happily.
+    The count the master actually picked is what the pool has to fill."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    conn, p = make_db(0)
+    try:
+        for i in range(6):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        real_connect = db.connect
+        monkeypatch.setattr(main.db, "connect", lambda *a, **kw: real_connect(p))
+        c = TestClient(main.app)
+        short = c.get("/api/round-filters/count?tiers=easy&rounds=5").json()
+        assert short["tracks"] == 6
+        assert short["rounds"] == 5
+        assert short["enough"] is True, "a 6-song pool really does play 5 rounds"
+        # the same pool, judged against the counts it genuinely cannot fill
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=20").json()["enough"] is False
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=7").json()["enough"] is False, \
+            "one round more than the pool holds"
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=6").json()["enough"] is True, \
+            "exactly as many songs as rounds is playable"
+        # ...and the count is optional: an old phone that sends none gets the 10-round rule
+        plain = c.get("/api/round-filters/count?tiers=easy").json()
+        assert plain["rounds"] == game.DEFAULT_ROUNDS and plain["enough"] is False
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_enough_for_10_still_means_ten_whatever_count_was_asked_about(monkeypatch):
+    """`enough_for_10` is a published key this route has always returned, so it must not
+    quietly start tracking the new param — a client reading it would then be told "enough
+    for 10" about a 3-round game. `enough` is the one that follows the choice."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    conn, p = make_db(0)
+    try:
+        for i in range(6):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        for i in range(6):
+            _insert_f(conn, f"p{i}", f"Pop Act {i}", "Pop", 2005)
+        real_connect = db.connect
+        monkeypatch.setattr(main.db, "connect", lambda *a, **kw: real_connect(p))
+        c = TestClient(main.app)
+        # a short game on the 6-track Rock pool: playable, but not ten rounds' worth
+        body = c.get("/api/round-filters/count?tiers=easy&genres=Rock&rounds=5").json()
+        assert body["enough"] is True and body["enough_for_10"] is False
+        # and the mirror: the whole 12-track library is fine for ten and short of twenty
+        body = c.get("/api/round-filters/count?tiers=easy&rounds=20").json()
+        assert body["enough"] is False and body["enough_for_10"] is True
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_round_count_below_one_is_refused_by_the_preflight(monkeypatch):
+    """A nought-round game finishes on the first tap and a negative one is nonsense; both
+    arrive as query params, so the route rejects them rather than answering `enough: True`
+    about a game that cannot be played."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    conn, p = make_db(0)
+    try:
+        for i in range(12):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        real_connect = db.connect
+        monkeypatch.setattr(main.db, "connect", lambda *a, **kw: real_connect(p))
+        c = TestClient(main.app)
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=0").status_code == 400
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=-3").status_code == 400
+        assert c.get("/api/round-filters/count?tiers=easy&rounds=1").status_code == 200
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_the_picker_is_told_which_counts_to_offer_and_which_include_half_time(monkeypatch):
+    """The buttons are built from this, not from a list kept in quiz.js: a count the phone
+    offers but the server won't preflight is a Start button that locks for no stated reason,
+    and half time silently absent from a short game reads as a bug."""
+    from fastapi.testclient import TestClient
+
+    from app import main
+    conn, p = make_db(0)
+    try:
+        for i in range(30):
+            _insert_f(conn, f"r{i}", f"Rock Band {i}", "Rock", 1995)
+        real_connect = db.connect
+        monkeypatch.setattr(main.db, "connect", lambda *a, **kw: real_connect(p))
+        body = TestClient(main.app).get("/api/round-filters?tiers=easy").json()
+        assert body["round_choices"] == list(game.ROUND_CHOICES)
+        assert body["default_rounds"] == game.DEFAULT_ROUNDS
+        assert body["halftime_min_rounds"] == game.HALFTIME_MIN_ROUNDS
+        assert game.DEFAULT_ROUNDS in body["round_choices"], "the default must be pickable"
+        assert all(game.MIN_ROUNDS <= n <= game.MAX_ROUNDS for n in body["round_choices"]), \
+            "a button the new_game handler would refuse"
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_three_round_game_really_plays_three_rounds_and_then_ends():
+    """The count has to reach the round list and the snapshot, not just the constructor: a
+    game that says "round 1 of 10" and stops after three is worse than no choice at all."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=3, tiers=["easy", "medium"], clock=clock)
+        g.join("Alice"); g.join("Bob")
+        g.build_rounds(conn)
+        assert len(g.rounds) == 3
+        assert len({r["track"]["id"] for r in g.rounds}) == 3, "no dupes in a short game"
+        assert g.snapshot()["total_rounds"] == 3, "the phones and the board count along"
+        for n in (1, 2, 3):
+            g.start_round(conn)
+            snap = g.snapshot()
+            assert (snap["round"], snap["total_rounds"]) == (n, 3)
+            clock.t += 1
+            g.answer("Alice", g.rounds[g.current]["correct"])
+            g.answer("Bob", (g.rounds[g.current]["correct"] + 1) % 4)
+            g.reveal()
+            assert g.is_last_round() is (n == 3), f"round {n} of 3"
+            assert not g.is_halfway(), "three rounds is too short for a break"
+            clock.t += game.PAYOFF_S
+        with pytest.raises(game.GameError):  # and there is no fourth
+            g.start_round(conn)
+        gid = g.finish(conn)
+        assert conn.execute("SELECT rounds FROM games WHERE id=?",
+                            (gid,)).fetchone()["rounds"] == 3
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_long_game_builds_every_round_it_was_asked_for():
+    """The other end of the picker. 15 is past the old hardcoded 10, so a constructor that
+    ignored the argument would build ten rounds and look fine."""
+    conn, p = make_db(40)
+    try:
+        g = game.Game(conn, rounds=15, tiers=["easy", "medium"], clock=Clock())
+        g.join("Sam")
+        g.build_rounds(conn)
+        assert len(g.rounds) == 15
+        assert len({r["track"]["id"] for r in g.rounds}) == 15, "no track asked twice"
+        assert g.snapshot()["total_rounds"] == 15
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_a_five_round_game_never_reaches_half_time():
+    """Below HALFTIME_MIN_ROUNDS a break is more interruption than interval, so a short game
+    deliberately has none. The positive case (6 rounds) is test_half_time_trivia_flow; this
+    is the boundary one below it, checked at EVERY point of a fully played game rather than
+    just at the middle — `is_halfway` is polled after each reveal, so one stray True anywhere
+    stops a 5-round game dead in a break it has no trivia stage for."""
+    conn, p = make_db()
+    try:
+        clock = Clock()
+        g = game.Game(conn, rounds=5, tiers=["easy", "medium"], clock=clock)
+        g.join("A"); g.join("B")
+        g.build_rounds(conn)
+        assert len(g.rounds) == 5 < game.HALFTIME_MIN_ROUNDS
+        assert not g.is_halfway(), "halfway in the lobby"
+        for _ in range(5):
+            g.start_round(conn)
+            assert not g.is_halfway(), f"half time offered during round {g.current + 1}"
+            clock.t += 1
+            g.answer("A", g.rounds[g.current]["correct"])
+            g.answer("B", 0 if g.rounds[g.current]["correct"] else 1)
+            g.reveal()
+            assert not g.is_halfway(), f"half time offered after round {g.current + 1}"
+            clock.t += game.PAYOFF_S
+        assert g.is_last_round()
+        # is_halfway is the ONLY thing standing between a short game and the break: the
+        # engine will start one from any reveal, so nothing else would catch a regression.
+        assert g.phase == "reveal" and g.tf_qs == []
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def _insert_fav(conn, tid, artist):
+    """A favourite-artist track in a tier the game itself never draws on.
+
+    That is what makes the boost counting exact rather than probabilistic: pick_artist_track
+    searches every tier, while the pool fill is restricted to the game's tiers, so a 'hard'
+    round can ONLY have arrived as somebody's boost.
+    """
+    _insert(conn, tid, f"Fav Song {tid}", artist, tier="hard", year=1995)
+
+
+def test_boosts_available_is_what_build_rounds_actually_hands_out():
+    """The phone warns with boosts_available() before Start, so it has to agree with the loop
+    that enforces the cap — a warning that says "2 of you get a boost" while the builder gives
+    three is worse than no warning. One neutral round is always kept back."""
+    conn, p = make_db(0)
+    try:
+        for i in range(20):
+            _insert_f(conn, f"pool{i}", f"Pool Act {i}", "Pop", 1995)
+        for i in range(5):
+            _insert_fav(conn, f"fav{i}", f"Fav Band {i}")
+        assert game.boosts_available(3) == 2
+        assert game.boosts_available(1) == 0, "a one-round game is all neutral"
+        assert game.boosts_available(0) == 0, "never negative"
+        g = game.Game(conn, rounds=3, tiers=["easy"], clock=Clock())
+        for i in range(5):  # five hopefuls, two slots
+            g.join(f"P{i}")
+            g.set_artists(f"P{i}", [f"Fav Band {i}"])
+        g.build_rounds(conn)
+        boosts = [r for r in g.rounds if r["track"]["tier"] == "hard"]
+        assert len(boosts) == game.boosts_available(3), \
+            f"{len(boosts)} boost rounds for {game.boosts_available(3)} slots"
+        assert len(g.rounds) - len(boosts) >= 1, "no neutral round left"
+        assert len(g.rounds) == 3
+    finally:
+        conn.close(); os.unlink(p)
+
+
+def test_who_misses_out_on_a_boost_is_not_decided_by_who_joined_first(monkeypatch):
+    """Before this, build_rounds walked self.players — which is join order — so with more
+    players than boost slots the quickest phone got a boost every single game and the last to
+    arrive never did. Who misses out is now shuffled.
+
+    Asserted by monkeypatching random.shuffle rather than by seeding and counting: a
+    statistical test over a genuinely random allocation is flaky, and a flaky test here is
+    worse than none. Both orderings are pinned, because only the pair proves the shuffle is
+    consulted at all — reverse gives the LAST joiner the slot, identity gives the first, and
+    a build_rounds that ignored random.shuffle would hand the slot to the first joiner in
+    both runs.
+    """
+    conn, p = make_db(0)
+    try:
+        for i in range(20):
+            _insert_f(conn, f"pool{i}", f"Pool Act {i}", "Pop", 1995)
+        for i in range(3):
+            _insert_fav(conn, f"fav{i}", f"Fav Band {i}")
+
+        def boosted(shuffle):
+            monkeypatch.setattr(game.random, "shuffle", shuffle)
+            g = game.Game(conn, rounds=2, tiers=["easy"], clock=Clock())
+            for i in range(3):        # three hopefuls, one slot: rounds - 1
+                g.join(f"P{i}")
+                g.set_artists(f"P{i}", [f"Fav Band {i}"])
+            g.build_rounds(conn)
+            boosts = [r["track"]["artist"] for r in g.rounds if r["track"]["tier"] == "hard"]
+            assert len(boosts) == game.boosts_available(2) == 1, boosts
+            return boosts[0]
+
+        assert boosted(lambda seq: seq.reverse()) == "Fav Band 2", \
+            "the last to join was never reached — build_rounds is still in join order"
+        assert boosted(lambda seq: None) == "Fav Band 0", \
+            "with the shuffle a no-op the order is join order, so this pins the seam"
+    finally:
+        conn.close(); os.unlink(p)

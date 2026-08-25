@@ -22,8 +22,8 @@
     ⚡ Faster answers score more points<br>
     🔁 Nobody guessing? The game master replays the clip, longer<br>
     ⭐ Pick 3 artists you know and a song of theirs sneaks in — your <b>boost round</b><br>
-    🍿 Half time: three true-or-false questions<br>
-    🏆 Ten rounds — highest score wins, and the all-time table remembers</p>
+    🍿 Half time: three true-or-false questions in a longer game<br>
+    🏆 Highest score wins, and the all-time table remembers</p>
   </div>
 
   <div id="v-join" class="card" hidden>
@@ -47,6 +47,9 @@
     <div id="decade-choice" class="wall" style="margin-top:.4em"></div>
     <p class="dim" style="margin-top:1.1em">Leave anything out? (the rest of the library still plays)</p>
     <div id="exclude-choice" class="wall"></div>
+    <p class="dim" style="margin-top:1.1em">How many rounds?</p>
+    <div id="rounds-choice" class="wall"></div>
+    <p class="center dim" id="rounds-note" style="margin:.4em 0 .2em;font-size:.85em"></p>
     <p class="center" id="filter-count" style="margin:.5em 0 .2em;font-size:.9em"></p>
     <button class="primary" id="start-game" onclick="startGame()">Start a new game</button>
   </div>
@@ -75,6 +78,7 @@
     </div>
     <div id="artist-picked" hidden><p class="dim">✅ Your artists are in. Waiting for the game…</p></div>
     <p class="dim center" id="lobby-where"><a href="#" id="lobby-where-link" onclick="toggleWhere();return false"></a></p>
+    <p class="center dim" id="lobby-boost-note" hidden style="margin:.4em 0 .2em;font-size:.85em"></p>
     <button class="primary" onclick="send({type:'start_round'})">▶ Start round 1</button>
     <p class="dim center" id="lobby-wait" hidden></p>
     <div id="lobby-invite" class="invite">
@@ -137,7 +141,7 @@
     <p class="big">🏆 Final scores</p>
     <div class="card"><ul class="scores" id="f-scores"></ul></div>
     <p class="center" id="f-next-master" hidden style="font-size:1.1em"></p>
-    <button class="primary" onclick="send({type:'new_game', rounds:10})">Play again</button>
+    <button class="primary" onclick="playAgain()">Play again</button>
   </div>
 
   <!-- All-time top scores. Every game ever played, kept in the database, so it
